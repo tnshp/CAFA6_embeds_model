@@ -22,7 +22,14 @@ from Dataset.Resample import resample
 from Dataset.EmbeddingsDataset import TokenizedEmbeddingsDataset, collate_tokenize
 from Model.Query2Label_pl import Query2Label_pl
 
-def train_from_configs(configs, run_name=None):
+def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
+        """Train model from configs with optional checkpoint resumption.
+        
+        Args:
+            configs: dict with data_paths, model_configs, training_configs
+            run_name: optional run name for logging/checkpointing
+            resume_from_checkpoint: optional path to checkpoint .ckpt file to resume training from
+        """
         # Set paths and load metadata
         data_paths = configs.get('data_paths', {})
         BASE_PATH = data_paths.get('base_path', "./cafa-6-protein-function-prediction/")
@@ -132,7 +139,12 @@ def train_from_configs(configs, run_name=None):
 
         # logging and callbacks
         log_dir = training_configs.get('log_dir', './logs')
-        logger = TensorBoardLogger(save_dir=log_dir, name=run_name or training_configs.get('run_name', 'query2label'))
+        # when resuming, append 'resume' to run_name to differentiate logs
+        if resume_from_checkpoint:
+            resume_run_name = (run_name or training_configs.get('run_name', 'query2label')) + '_resume'
+        else:
+            resume_run_name = run_name or training_configs.get('run_name', 'query2label')
+        logger = TensorBoardLogger(save_dir=log_dir, name=resume_run_name)
 
         # Checkpointing: save top-k models by validation macro F1 (higher is better)
         top_k = int(training_configs.get('checkpoint_top_k', 3))
@@ -170,8 +182,19 @@ def train_from_configs(configs, run_name=None):
                              logger=logger,
                              callbacks=[checkpoint_cb, lr_monitor, early_stop])
 
-        # train
-        trainer.fit(model, train_loader, val_loader)
+        # train (with optional resume from checkpoint)
+        if resume_from_checkpoint is None:
+            # try to load from config if not provided via CLI
+            resume_from_checkpoint = training_configs.get('resume_checkpoint_path', None)
+        
+        if resume_from_checkpoint:
+            if not os.path.exists(resume_from_checkpoint):
+                print(f"Warning: resume checkpoint path does not exist: {resume_from_checkpoint}")
+                resume_from_checkpoint = None
+            else:
+                print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
+        
+        trainer.fit(model, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
 
         # Save tokenizer once (only if a best checkpoint was found)
         try:
@@ -209,6 +232,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Protein GO Classifier with PyTorch Lightning")
     parser.add_argument('--config', type=str, default='./configs.json', help='Path to config JSON file')
     parser.add_argument('--run_name', type=str, default=None, help='Optional run name for logging')
+    parser.add_argument('--resume', type=str, default=None, help='Optional path to checkpoint .ckpt file to resume training from')
     args = parser.parse_args()
 
     configs = json.load(open(args.config))
@@ -216,7 +240,8 @@ if __name__ == "__main__":
     
     # run training
     run_name = args.run_name
-    train_from_configs(configs, run_name=run_name)
+    resume_from_checkpoint = args.resume
+    train_from_configs(configs, run_name=run_name, resume_from_checkpoint=resume_from_checkpoint)
 
 
 
