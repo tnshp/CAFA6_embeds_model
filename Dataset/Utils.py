@@ -38,6 +38,10 @@ def prepare_data_range(train_term_df, embed_ids: list, embeds_np: np.ndarray, to
     mlb = MultiLabelBinarizer(classes=top_terms)
     labels_binary = mlb.fit_transform(labels_list)
 
+    valid_embeds = np.array(valid_embeds)
+    valid_entries = np.array(valid_entries)
+    labels_binary = np.array(labels_binary)
+    
     return {
         'entries': valid_entries,
         'embeds': valid_embeds,
