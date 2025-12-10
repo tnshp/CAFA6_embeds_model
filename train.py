@@ -55,8 +55,8 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
         embeds_path = data_paths.get('embeds_path', '/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm2_embeds_cafa5/train_embeddings.npy')
         ids_path = data_paths.get('ids_path', '/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm2_embeds_cafa5/train_ids.npy')
 
-        train_embeds = np.load(embeds_path) 
-        train_ids = np.load(ids_path)
+        train_embeds = np.load(embeds_path, allow_pickle=True) 
+        train_ids = np.load(ids_path, allow_pickle=True)
         print(f"Training embeddings loaded. Num samples: {train_embeds.shape[0]}, dim: {train_embeds.shape[1:]}")
 
         # preparing data (use numpy-based prepare_data_range to avoid large pandas DataFrames)
@@ -169,12 +169,12 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
 
         # dirpath ensures checkpoints are saved to the requested folder (not the default lightning logs)
         checkpoint_cb = ModelCheckpoint(dirpath=checkpoint_dir,
-                                        monitor='val_f1_macro', mode='max', save_top_k=top_k,
-                                        save_last=False,
-                                        filename='{epoch:02d}-{val_f1_macro:.4f}')
+                        monitor='val_fmax_macro', mode='max', save_top_k=top_k,
+                        save_last=False,
+                        filename='{epoch:02d}-{val_fmax_macro:.4f}')
         lr_monitor = LearningRateMonitor(logging_interval='step')
-        # Early stopping still uses val loss by default (lower is better)
-        early_stop = EarlyStopping(monitor='val_loss_epoch', patience=int(training_configs.get('patience', 5)), mode='min')
+        # Early stopping: monitor F-max (higher is better)
+        early_stop = EarlyStopping(monitor='val_fmax_macro', patience=int(training_configs.get('patience', 5)), mode='max')
 
         trainer = pl.Trainer(max_epochs=max_epochs,
                              accelerator='auto',

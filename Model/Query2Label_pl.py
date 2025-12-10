@@ -49,6 +49,9 @@ class Query2Label_pl(pl.LightningModule):
         # Test metrics/state
         self.test_f1_metric = MultilabelF1Score(num_labels=num_classes, average=None, threshold=0.5)
         self.test_step_outputs = []
+        # For F-max computation (store probabilities and targets across val epoch)
+        self._val_probs = []
+        self._val_targets = []
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -100,6 +103,12 @@ class Query2Label_pl(pl.LightningModule):
 
         # Store for epoch end aggregation
         self.validation_step_outputs.append({'val_loss': loss.detach()})
+        # store probabilities and targets for F-max computation (move to CPU to save GPU memory)
+        try:
+            self._val_probs.append(probs.detach().cpu())
+            self._val_targets.append(targets.detach().cpu())
+        except Exception:
+            pass
 
     def on_validation_epoch_end(self) -> None:
         """Called at the end of validation epoch. Aggregate metrics and reset."""
@@ -146,8 +155,45 @@ class Query2Label_pl(pl.LightningModule):
                 self.val_f1_metric.reset()
             except Exception:
                 pass
-        else:
-            # if torchmetrics failed, fallback to noting missing metric
+        # Compute F-max (best F1 over thresholds) across validation epoch
+        try:
+            if len(self._val_probs) > 0:
+                probs_all = torch.cat(self._val_probs, dim=0)  # (N, C)
+                targets_all = torch.cat(self._val_targets, dim=0)  # (N, C)
+                # thresholds from 0.0 to 1.0 (inclusive)
+                thresholds = torch.linspace(0.0, 1.0, steps=101)
+                C = targets_all.shape[1]
+                per_class_f1_max = torch.zeros(C)
+                eps = 1e-8
+                for t in thresholds:
+                    preds_t = (probs_all > t).int()
+                    tp = (preds_t & targets_all).sum(dim=0).float()
+                    fp = (preds_t & (1 - targets_all)).sum(dim=0).float()
+                    fn = ((1 - preds_t) & targets_all).sum(dim=0).float()
+                    precision = tp / (tp + fp + eps)
+                    recall = tp / (tp + fn + eps)
+                    f1 = 2 * precision * recall / (precision + recall + eps)
+                    # replace NaNs with zeros
+                    f1 = torch.nan_to_num(f1, nan=0.0)
+                    per_class_f1_max = torch.maximum(per_class_f1_max, f1)
+
+                val_fmax_macro = float(per_class_f1_max.mean().item())
+                self.log('val_fmax_macro', val_fmax_macro, prog_bar=True, logger=True)
+                # also log per-class fmax if desired (may be many classes)
+                per_class_dict = {f'val_fmax_class_{i}': float(per_class_f1_max[i].item()) for i in range(per_class_f1_max.numel())}
+                self.log_dict(per_class_dict, prog_bar=False, logger=True)
+                try:
+                    # clear stored buffers
+                    self._val_probs.clear()
+                    self._val_targets.clear()
+                except Exception:
+                    pass
+        except Exception:
+            # if anything goes wrong computing F-max, skip it
+            pass
+
+        # if torchmetrics failed earlier, fallback to noting missing metric
+        if per_class_f1 is None:
             self.log('val_f1_macro', 0.0, prog_bar=True, logger=True)
         
         # Clear stored outputs for next epoch
