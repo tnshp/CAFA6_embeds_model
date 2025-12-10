@@ -39,7 +39,7 @@ class Query2Label_pl(pl.LightningModule):
             use_positional_encoding=use_positional_encoding,
         )
 
-        self.criterion = AsymmetricLossOptimized()
+        self.criterion = AsymmetricLoss()
 
         # Torchmetrics: per-class F1 (we will compute per-class and average in on_validation_epoch_end)
         self.val_f1_metric = MultilabelF1Score(num_labels=num_classes, average=None, threshold=0.5)

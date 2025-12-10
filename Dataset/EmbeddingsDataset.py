@@ -10,7 +10,7 @@ class TokenizedEmbeddingsDataset(Dataset):
         self.oversample_indices = oversample_indices if oversample_indices is not None else list(range(len(self.data['embeds'])))
 
     def __len__(self):
-        return len(self.oversample_indices)
+        return len(self.oversample_indices)         
 
     def __getitem__(self, idx):
         sample_idx = self.oversample_indices[idx]

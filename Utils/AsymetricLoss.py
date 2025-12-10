@@ -98,7 +98,7 @@ class AsymmetricLoss(nn.Module):
             # Apply focal weight to loss
             loss *= one_sided_w
         
-        return -loss.sum()
+        return -loss.mean()
 
 
 class AsymmetricLossOptimized(nn.Module):
