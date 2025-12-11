@@ -64,6 +64,7 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
         data = prepare_data_range(train_terms_df, train_ids, train_embeds, k_range)
         print(f"Prepared data with {len(data['entries'])} entries and {data['num_classes']} classes for top_k range {k_range}.")
 
+        
         # Determine sampling / splitting behavior
         sampling_instances = training_configs.get('sampling_instances', None)
         val_fraction = float(training_configs.get('val_fraction', 0.3))
@@ -180,6 +181,8 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
             checkpoint_dir = configured_ckpt_dir
         else:
             checkpoint_dir = os.path.join(logger.log_dir, 'checkpoints')
+
+        
         # Create run-specific subdirectory inside checkpoint_dir
         run_name_for_ckpt = run_name or training_configs.get('run_name', 'default_run')
         checkpoint_dir = os.path.join(checkpoint_dir, run_name_for_ckpt)
@@ -190,6 +193,10 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
             with open(configs_path, 'w') as cf:
                 json.dump(configs, cf, indent=2)
             print(f"Saved run configs to: {configs_path}")
+            #saving the top terms to checkpoint directory later
+            np.save(os.path.join(checkpoint_dir, 'top_terms.npy'), np.array(data['top_terms']))
+            print(f"Saved top terms to: {os.path.join(checkpoint_dir, 'top_terms.npy')}")
+            
         except Exception as e:
             print(f"Warning: failed to save configs to checkpoint dir: {e}")
 
