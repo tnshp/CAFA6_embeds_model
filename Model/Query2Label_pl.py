@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from Utils.AsymetricLoss import AsymmetricLossOptimized, AsymmetricLoss
+from Utils.AsymetricLoss import  AsymmetricLoss
 from Model.Query2Label import Query2Label
 import numpy as np
 import math
@@ -24,6 +24,12 @@ class Query2Label_pl(pl.LightningModule):
         use_positional_encoding: bool = True,
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
+        # Asymmetric loss parameters
+        gamma_neg: float = 4.0,
+        gamma_pos: float = 0.0,
+        clip: float = 0.05,
+        loss_eps: float = 1e-8,
+        disable_torch_grad_focal_loss: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -39,7 +45,14 @@ class Query2Label_pl(pl.LightningModule):
             use_positional_encoding=use_positional_encoding,
         )
 
-        self.criterion = AsymmetricLoss()
+    
+        self.criterion = AsymmetricLoss(
+            gamma_neg=gamma_neg,
+            gamma_pos=gamma_pos,
+            clip=clip,
+            eps=loss_eps,
+            disable_torch_grad_focal_loss=disable_torch_grad_focal_loss,
+        )
 
         # Torchmetrics: per-class F1 (we will compute per-class and average in on_validation_epoch_end)
         self.val_f1_metric = MultilabelF1Score(num_labels=num_classes, average=None, threshold=0.5)

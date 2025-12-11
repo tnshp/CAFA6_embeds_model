@@ -64,23 +64,43 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
         data = prepare_data_range(train_terms_df, train_ids, train_embeds, k_range)
         print(f"Prepared data with {len(data['entries'])} entries and {data['num_classes']} classes for top_k range {k_range}.")
 
-        # resample / oversample indices for training
-        sampled_idx = resample(data, train_terms_df, strategy=training_configs.get('sampling_strategy', ''), I=training_configs.get('sampling_instances', 100000))
-        if not sampled_idx:
-            print("Warning: resample returned no indices (empty). Falling back to using all available indices for training.")
-            sampled_idx = list(range(len(data['entries'])))
+        # Determine sampling / splitting behavior
+        sampling_instances = training_configs.get('sampling_instances', None)
+        val_fraction = float(training_configs.get('val_fraction', 0.3))
+        seed = training_configs.get('seed', None)
 
-        print(f"Resampled {len(sampled_idx)} indices for training (with repetitions).")
-
-        # use all UNIQUE indices in sampled_idx for training (class-balanced)
-        unique_train_idx = np.unique(sampled_idx)
-        print(f"Unique training indices: {len(unique_train_idx)}")
-
-        # split remaining indices for validation (no test set)
         all_idx = np.arange(len(data['entries']))
-        remaining_idx = np.setdiff1d(all_idx, unique_train_idx)
-        val_idx = remaining_idx.tolist()
-        print(f"Val indices: {len(val_idx)} (using all remaining indices), Test set removed")
+
+        if sampling_instances is not None:
+            # resample / oversample indices for training (may include repetitions)
+            sampled_idx = resample(data, train_terms_df, strategy=training_configs.get('sampling_strategy', ''), I=sampling_instances)
+            if not sampled_idx:
+                print("Warning: resample returned no indices (empty). Falling back to using all available indices for training.")
+                sampled_idx = list(range(len(data['entries'])))
+
+            print(f"Resampled {len(sampled_idx)} indices for training (with repetitions).")
+
+            # use all UNIQUE indices in sampled_idx for training (class-balanced)
+            unique_train_idx = np.unique(sampled_idx)
+            print(f"Unique training indices: {len(unique_train_idx)}")
+
+            # split remaining indices for validation (no test set)
+            remaining_idx = np.setdiff1d(all_idx, unique_train_idx)
+            val_idx = remaining_idx.tolist()
+            print(f"Val indices: {len(val_idx)} (using all remaining indices), Test set removed")
+        else:
+            # No sampling_instances provided: split indices randomly into train/val according to val_fraction
+            rng = np.random.RandomState(seed) if seed is not None else np.random
+            perm = rng.permutation(all_idx)
+            n_val = int(np.round(len(all_idx) * val_fraction))
+            val_idx = perm[:n_val].tolist()
+            train_idx = perm[n_val:].tolist()
+
+            # For consistency with downstream code, set sampled_idx to train indices (no repetitions)
+            sampled_idx = list(train_idx)
+            unique_train_idx = np.array(train_idx)
+
+            print(f"No sampling_instances set: randomly split {len(all_idx)} indices into {len(train_idx)} train and {len(val_idx)} val (val_fraction={val_fraction}).")
 
         # build tokenizer
         embedding_dim = int(np.asarray(data['embeds'][0]).shape[0])
@@ -120,7 +140,13 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
                                dropout=model_configs.get('dropout', 0.1),
                                use_positional_encoding=model_configs.get('use_positional_encoding', True),
                                lr=training_configs.get('lr', 1e-4),
-                               weight_decay=training_configs.get('weight_decay', 1e-5))
+                               weight_decay=training_configs.get('weight_decay', 1e-5),
+                               # pass asymmetric loss params from configs
+                               gamma_neg=float(training_configs.get('gamma_neg', 4.0)),
+                               gamma_pos=float(training_configs.get('gamma_pos', 0.0)),
+                               clip=float(training_configs.get('clip', 0.05)),
+                               loss_eps=float(training_configs.get('loss_eps', 1e-8)),
+                               disable_torch_grad_focal_loss=bool(training_configs.get('disable_torch_grad_focal_loss', True)))
 
         # compute total steps for scheduler and set on model.hparams
         max_epochs = int(training_configs.get('max_epochs', 10))
