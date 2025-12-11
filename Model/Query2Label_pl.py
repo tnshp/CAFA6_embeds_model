@@ -1,14 +1,10 @@
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from Utils.AsymetricLoss import  AsymmetricLoss
+from Utils.AsymetricLoss import AsymmetricLossOptimized, AsymmetricLoss
 from Model.Query2Label import Query2Label
 import numpy as np
 import math
-try:
-    from torchmetrics.classification import MultilabelF1Score
-except Exception:  # fallback import path for different torchmetrics versions
-    from torchmetrics.classification.multilabel import MultilabelF1Score
 
 
 class Query2Label_pl(pl.LightningModule):
@@ -54,13 +50,9 @@ class Query2Label_pl(pl.LightningModule):
             disable_torch_grad_focal_loss=disable_torch_grad_focal_loss,
         )
 
-        # Torchmetrics: per-class F1 (we will compute per-class and average in on_validation_epoch_end)
-        self.val_f1_metric = MultilabelF1Score(num_labels=num_classes, average=None, threshold=0.5)
-        
         # Store validation step outputs for on_validation_epoch_end
         self.validation_step_outputs = []
-        # Test metrics/state
-        self.test_f1_metric = MultilabelF1Score(num_labels=num_classes, average=None, threshold=0.5)
+        # Test step outputs
         self.test_step_outputs = []
         # For F-max computation (store probabilities and targets across val epoch)
         self._val_probs = []
@@ -87,10 +79,7 @@ class Query2Label_pl(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step computes loss and logs it.
-
-        Stores loss in instance attribute for on_validation_epoch_end.
-        """
+        """Validation step computes loss and stores for F-max computation."""
         x = batch['tokens']
         y = batch['label'].float()
 
@@ -100,23 +89,11 @@ class Query2Label_pl(pl.LightningModule):
         # Log per-step validation loss (will be reduced automatically)
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
-        # Update torchmetrics multilabel F1 metric (stores per-class counts)
-        probs = torch.sigmoid(logits)
-        preds = (probs > 0.5).int()
-        targets = (y > 0.5).int()
-        # update stateful metric
-        try:
-            self.val_f1_metric.update(preds, targets)
-        except Exception:
-            # some torchmetrics versions accept (preds, targets) ordering; catch and try swapped order
-            try:
-                self.val_f1_metric.update(targets, preds)
-            except Exception:
-                pass
-
         # Store for epoch end aggregation
         self.validation_step_outputs.append({'val_loss': loss.detach()})
         # store probabilities and targets for F-max computation (move to CPU to save GPU memory)
+        probs = torch.sigmoid(logits)
+        targets = (y > 0.5).int()
         try:
             self._val_probs.append(probs.detach().cpu())
             self._val_targets.append(targets.detach().cpu())
@@ -124,50 +101,15 @@ class Query2Label_pl(pl.LightningModule):
             pass
 
     def on_validation_epoch_end(self) -> None:
-        """Called at the end of validation epoch. Aggregate metrics and reset."""
+        """Called at the end of validation epoch. Compute F-max only."""
         # compute mean validation loss for the epoch
         if not self.validation_step_outputs:
             return
         losses = torch.stack([o['val_loss'] for o in self.validation_step_outputs])
         mean_loss = losses.mean()
 
-        # compute per-class F1 using torchmetrics
-        try:
-            per_class_f1 = self.val_f1_metric.compute()  # Tensor shape (num_classes,)
-        except Exception:
-            # fallback: try calling as function
-            try:
-                per_class_f1 = self.val_f1_metric(preds=None, target=None)
-            except Exception:
-                per_class_f1 = None
-
         self.log('val_loss_epoch', mean_loss, prog_bar=True, logger=True)
 
-        if per_class_f1 is not None:
-            # ensure CPU tensor
-            per_class_f1 = per_class_f1.detach().cpu()
-            # macro = average across classes
-            macro_f1 = float(per_class_f1.mean().item())
-            self.log('val_f1_macro', macro_f1, prog_bar=True, logger=True)
-
-            # log per-class F1 individually (may be many classes)
-            per_class_dict = {f'val_f1_class_{i}': float(per_class_f1[i].item()) for i in range(per_class_f1.numel())}
-            # log without flooding progress bar
-            self.log_dict(per_class_dict, prog_bar=False, logger=True)
-
-            # Print macro F1 to stdout (only on main process)
-            try:
-                rank = getattr(self, 'global_rank', 0)
-            except Exception:
-                rank = 0
-            if rank == 0:
-                print(f"Validation Macro F1: {macro_f1:.4f}")
-
-            # reset metric state for next epoch
-            try:
-                self.val_f1_metric.reset()
-            except Exception:
-                pass
         # Compute F-max (best F1 over thresholds) across validation epoch
         try:
             if len(self._val_probs) > 0:
@@ -195,6 +137,13 @@ class Query2Label_pl(pl.LightningModule):
                 # also log per-class fmax if desired (may be many classes)
                 per_class_dict = {f'val_fmax_class_{i}': float(per_class_f1_max[i].item()) for i in range(per_class_f1_max.numel())}
                 self.log_dict(per_class_dict, prog_bar=False, logger=True)
+                # Print macro F-max to stdout (only on main process)
+                try:
+                    rank = getattr(self, 'global_rank', 0)
+                except Exception:
+                    rank = 0
+                if rank == 0:
+                    print(f"Validation Macro F-max: {val_fmax_macro:.4f}")
                 try:
                     # clear stored buffers
                     self._val_probs.clear()
@@ -204,16 +153,12 @@ class Query2Label_pl(pl.LightningModule):
         except Exception:
             # if anything goes wrong computing F-max, skip it
             pass
-
-        # if torchmetrics failed earlier, fallback to noting missing metric
-        if per_class_f1 is None:
-            self.log('val_f1_macro', 0.0, prog_bar=True, logger=True)
         
         # Clear stored outputs for next epoch
         self.validation_step_outputs.clear()
 
     def test_step(self, batch, batch_idx):
-        """Test step mirrors validation_step but stores test outputs."""
+        """Test step computes loss and logs it."""
         x = batch['tokens']
         y = batch['label'].float()
 
@@ -223,56 +168,17 @@ class Query2Label_pl(pl.LightningModule):
         # Log per-step test loss
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
-        probs = torch.sigmoid(logits)
-        preds = (probs > 0.5).int()
-        targets = (y > 0.5).int()
-        try:
-            self.test_f1_metric.update(preds, targets)
-        except Exception:
-            try:
-                self.test_f1_metric.update(targets, preds)
-            except Exception:
-                pass
-
         self.test_step_outputs.append({'test_loss': loss.detach()})
 
     def on_test_epoch_end(self) -> None:
-        """Aggregate test metrics at epoch end and log/print them."""
+        """Aggregate test metrics at epoch end and log them."""
         if not self.test_step_outputs:
             return
         losses = torch.stack([o['test_loss'] for o in self.test_step_outputs])
         mean_loss = losses.mean()
 
-        # compute per-class F1
-        try:
-            per_class_f1 = self.test_f1_metric.compute()
-        except Exception:
-            try:
-                per_class_f1 = self.test_f1_metric(preds=None, target=None)
-            except Exception:
-                per_class_f1 = None
-
         self.log('test_loss_epoch', mean_loss, prog_bar=True, logger=True)
-
-        if per_class_f1 is not None:
-            per_class_f1 = per_class_f1.detach().cpu()
-            macro_f1 = float(per_class_f1.mean().item())
-            self.log('test_f1_macro', macro_f1, prog_bar=True, logger=True)
-            per_class_dict = {f'test_f1_class_{i}': float(per_class_f1[i].item()) for i in range(per_class_f1.numel())}
-            self.log_dict(per_class_dict, prog_bar=False, logger=True)
-            # print on main rank
-            try:
-                rank = getattr(self, 'global_rank', 0)
-            except Exception:
-                rank = 0
-            if rank == 0:
-                print(f"Test Macro F1: {macro_f1:.4f}")
-            try:
-                self.test_f1_metric.reset()
-            except Exception:
-                pass
-        else:
-            self.log('test_f1_macro', 0.0, prog_bar=True, logger=True)
+        print(f"Test Loss: {mean_loss:.4f}")
 
         self.test_step_outputs.clear()
 
