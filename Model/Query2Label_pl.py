@@ -20,6 +20,8 @@ class Query2Label_pl(pl.LightningModule):
         use_positional_encoding: bool = True,
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
+        # Loss selection: 'ASL' or 'BCE'
+        loss_function: str = 'ASL',
         # Asymmetric loss parameters
         gamma_neg: float = 4.0,
         gamma_pos: float = 0.0,
@@ -42,13 +44,31 @@ class Query2Label_pl(pl.LightningModule):
         )
 
     
-        self.criterion = AsymmetricLoss(
-            gamma_neg=gamma_neg,
-            gamma_pos=gamma_pos,
-            clip=clip,
-            eps=loss_eps,
-            disable_torch_grad_focal_loss=disable_torch_grad_focal_loss,
-        )
+        # Instantiate chosen loss function
+        lf = (loss_function or 'ASL').upper()
+        if lf in ('ASL', 'ASYMMETRIC', 'ASYMMETRIC_LOSS'):
+            # prefer optimized implementation
+            try:
+                self.criterion = AsymmetricLossOptimized(
+                    gamma_neg=gamma_neg,
+                    gamma_pos=gamma_pos,
+                    clip=clip,
+                    eps=loss_eps,
+                    disable_torch_grad_focal_loss=disable_torch_grad_focal_loss,
+                )
+            except Exception:
+                self.criterion = AsymmetricLoss(
+                    gamma_neg=gamma_neg,
+                    gamma_pos=gamma_pos,
+                    clip=clip,
+                    eps=loss_eps,
+                    disable_torch_grad_focal_loss=disable_torch_grad_focal_loss,
+                )
+        elif lf in ('BCE', 'BCEWITHLOGITS', 'BCEWITHLOGITSLOSS'):
+            # Use BCEWithLogitsLoss; set reduction='sum' to match ASL sum-based scale
+            self.criterion = nn.BCEWithLogitsLoss(reduction='sum')
+        else:
+            raise ValueError(f"Unsupported loss_function: {loss_function}. Supported: 'ASL', 'BCE'.")
 
         # Store validation step outputs for on_validation_epoch_end
         self.validation_step_outputs = []
