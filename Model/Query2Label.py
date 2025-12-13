@@ -3,6 +3,35 @@ import torch.nn as nn
 import math
 
 
+class MultiClassLinear(nn.Module):
+    """Individual linear layer for each class (vectorized)."""
+    
+    def __init__(self, num_classes: int, in_features: int):
+        super().__init__()
+        self.num_classes = num_classes
+        self.in_features = in_features
+        
+        # Weight: (num_classes, in_features)
+        self.W = nn.Parameter(torch.Tensor(num_classes, in_features))
+        # Bias: (num_classes,)
+        self.b = nn.Parameter(torch.Tensor(num_classes))
+        
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.W)
+        nn.init.constant_(self.b, 0.0)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, num_classes, in_features)
+        Returns: (B, num_classes)
+        """
+        # Vectorized: einsum computes x @ W.T + b for each class
+        logits = torch.einsum('bni,ni->bn', x, self.W) + self.b
+        return logits
+
+
 class PositionalEncoding(nn.Module):
     """
     Standard sine-cosine positional encoding for 1D sequences.
@@ -92,8 +121,8 @@ class Query2Label(nn.Module):
         # Learnable label embeddings as queries (one per class)
         self.label_queries = nn.Embedding(num_classes, hidden_dim)
 
-        # Classification head: project decoded label features → logits
-        self.classifier = nn.Linear(hidden_dim, 1)
+        # Classification head: individual linear layer for each class
+        self.classifier = MultiClassLinear(num_classes, hidden_dim)
 
         self._reset_parameters()
 
@@ -102,9 +131,7 @@ class Query2Label(nn.Module):
         # if self.in_proj.bias is not None:
         #     nn.init.constant_(self.in_proj.bias, 0.0)
         nn.init.xavier_uniform_(self.label_queries.weight)
-        nn.init.xavier_uniform_(self.classifier.weight)
-        if self.classifier.bias is not None:
-            nn.init.constant_(self.classifier.bias, 0.0)
+        # MultiClassLinear handles its own initialization
 
     def forward(
         self,
@@ -145,8 +172,8 @@ class Query2Label(nn.Module):
             memory_key_padding_mask=src_key_padding_mask,
         )  # (B, num_classes, D)
 
-        # classification per label
-        logits = self.classifier(hs).squeeze(-1)  # (B, num_classes)
+        # classification per label (vectorized)
+        logits = self.classifier(hs)  # (B, num_classes)
 
         return logits
 
