@@ -208,27 +208,34 @@ class Query2Label_pl(pl.LightningModule):
         weight_decay = self.hparams.get('weight_decay', 1e-5) if isinstance(self.hparams, dict) else getattr(self.hparams, 'weight_decay', 1e-5)
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
 
-        # Optional scheduler with linear warmup + cosine decay. Requires `total_steps` and `warmup_steps` in hparams.
-        total_steps = self.hparams.get('total_steps', None) if isinstance(self.hparams, dict) else getattr(self.hparams, 'total_steps', None)
-        warmup_steps = self.hparams.get('warmup_steps', 0) if isinstance(self.hparams, dict) else getattr(self.hparams, 'warmup_steps', 0)
+        # Use ReduceLROnPlateau scheduler (monitoring validation metric 'val_fmax_macro').
+        # Parameters can be provided via hparams: 'plateau_factor', 'plateau_patience', 'min_lr', 'plateau_threshold'.
+        if isinstance(self.hparams, dict):
+            plateau_factor = self.hparams.get('plateau_factor', 0.5)
+            plateau_patience = int(self.hparams.get('plateau_patience', 3))
+            plateau_min_lr = self.hparams.get('min_lr', 1e-6)
+            plateau_threshold = self.hparams.get('plateau_threshold', 1e-4)
+        else:
+            plateau_factor = getattr(self.hparams, 'plateau_factor', 0.5)
+            plateau_patience = int(getattr(self.hparams, 'plateau_patience', 3))
+            plateau_min_lr = getattr(self.hparams, 'min_lr', 1e-6)
+            plateau_threshold = getattr(self.hparams, 'plateau_threshold', 1e-4)
 
-        if total_steps is None or total_steps <= 0:
-            return optimizer
-
-        def lr_lambda(current_step: int):
-            if current_step < warmup_steps:
-                return float(current_step) / float(max(1, warmup_steps))
-            # cosine decay after warmup
-            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='max',
+            factor=float(plateau_factor),
+            patience=int(plateau_patience),
+            min_lr=float(plateau_min_lr),
+            threshold=float(plateau_threshold)
+        )
 
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'interval': 'step',  # step per training batch
+                'monitor': 'val_fmax_macro',
+                'interval': 'epoch',
                 'frequency': 1,
             },
         }
