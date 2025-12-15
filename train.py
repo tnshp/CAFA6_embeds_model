@@ -22,42 +22,58 @@ from Dataset.Resample import resample
 from Dataset.EmbeddingsDataset import TokenizedEmbeddingsDataset, collate_tokenize
 from Model.Query2Label_pl import Query2Label_pl
 
-def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
+def train_from_configs(configs, run_name=None, resume_from_checkpoint=None, 
+                       train_terms_df=None, train_embeds=None, train_ids=None,
+                       go_graph=None, ia_map=None, train_seq=None):
         """Train model from configs with optional checkpoint resumption.
         
         Args:
             configs: dict with data_paths, model_configs, training_configs
             run_name: optional run name for logging/checkpointing
             resume_from_checkpoint: optional path to checkpoint .ckpt file to resume training from
+            train_terms_df: pre-loaded training terms dataframe (optional, will load if None)
+            train_embeds: pre-loaded training embeddings (optional, will load if None)
+            train_ids: pre-loaded training IDs (optional, will load if None)
+            go_graph: pre-loaded GO graph (optional, will load if None)
+            ia_map: pre-loaded information accretion map (optional, will load if None)
+            train_seq: pre-loaded training sequences (optional, will load if None)
         """
-        # Set paths and load metadata
+        # Set paths and load metadata (only if not provided)
         data_paths = configs.get('data_paths', {})
         BASE_PATH = data_paths.get('base_path', "./cafa-6-protein-function-prediction/")
-        go_graph = obonet.read_obo(os.path.join(BASE_PATH, 'Train/go-basic.obo'))
-        print(f"Gene Ontology graph loaded with {len(go_graph)} nodes and {len(go_graph.edges)} edges.")
-        train_terms_df = pd.read_csv(os.path.join(BASE_PATH, 'Train/train_terms.tsv'), sep='\t')
-        print(f"Training terms loaded. Shape: {train_terms_df.shape}")
-        train_fasta_path = os.path.join(BASE_PATH, 'Train/train_sequences.fasta')
-        print(f"Training sequences path set: {train_fasta_path}")
-        ia_df = pd.read_csv(os.path.join(BASE_PATH, 'IA.tsv'), sep='\t', header=None, names=['term_id', 'ia_score'])
-        ia_map = dict(zip(ia_df['term_id'], ia_df['ia_score']))
-        print(f"Information Accretion scores loaded for {len(ia_map)} terms.")
-
-        # read sequences (not used directly here but keep for compatibility)
-        train_seq = read_fasta(train_fasta_path)
+        
+        if go_graph is None:
+            go_graph = obonet.read_obo(os.path.join(BASE_PATH, 'Train/go-basic.obo'))
+            print(f"Gene Ontology graph loaded with {len(go_graph)} nodes and {len(go_graph.edges)} edges.")
+        
+        if train_terms_df is None:
+            train_terms_df = pd.read_csv(os.path.join(BASE_PATH, 'Train/train_terms.tsv'), sep='\t')
+            print(f"Training terms loaded. Shape: {train_terms_df.shape}")
+        
+        if ia_map is None:
+            train_fasta_path = os.path.join(BASE_PATH, 'Train/train_sequences.fasta')
+            print(f"Training sequences path set: {train_fasta_path}")
+            ia_df = pd.read_csv(os.path.join(BASE_PATH, 'IA.tsv'), sep='\t', header=None, names=['term_id', 'ia_score'])
+            ia_map = dict(zip(ia_df['term_id'], ia_df['ia_score']))
+            print(f"Information Accretion scores loaded for {len(ia_map)} terms.")
+        
+        if train_seq is None:
+            train_fasta_path = os.path.join(BASE_PATH, 'Train/train_sequences.fasta')
+            train_seq = read_fasta(train_fasta_path)
 
         # configs
         model_configs = configs.get('model_configs', {})
         training_configs = configs.get('training_configs', {})
 
-        # loading embeddings
-        print("Loading training embeddings...")
-        embeds_path = data_paths.get('embeds_path', '/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm2_embeds_cafa5/train_embeddings.npy')
-        ids_path = data_paths.get('ids_path', '/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm2_embeds_cafa5/train_ids.npy')
+        # loading embeddings (only if not provided)
+        if train_embeds is None or train_ids is None:
+            print("Loading training embeddings...")
+            embeds_path = data_paths.get('embeds_path', '/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm2_embeds_cafa5/train_embeddings.npy')
+            ids_path = data_paths.get('ids_path', '/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm2_embeds_cafa5/train_ids.npy')
 
-        train_embeds = np.load(embeds_path, allow_pickle=True) 
-        train_ids = np.load(ids_path, allow_pickle=True)
-        print(f"Training embeddings loaded. Num samples: {train_embeds.shape[0]}, dim: {train_embeds.shape[1:]}")
+            train_embeds = np.load(embeds_path, allow_pickle=True) 
+            train_ids = np.load(ids_path, allow_pickle=True)
+            print(f"Training embeddings loaded. Num samples: {train_embeds.shape[0]}, dim: {train_embeds.shape[1:]}")
 
         # preparing data (use numpy-based prepare_data_range to avoid large pandas DataFrames)
         k_range = model_configs.get('k_range', [0, 64])
@@ -176,7 +192,7 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
         logger = TensorBoardLogger(save_dir=log_dir, name=resume_run_name)
 
         # Checkpointing: save top-k models by validation macro F1 (higher is better)
-        top_k = int(training_configs.get('checkpoint_top_k', 3))
+        top_k = int(training_configs.get('save_top_k', training_configs.get('checkpoint_top_k', 3)))
         # allow explicit checkpoint directory in configs; otherwise default to logger dir + /checkpoints
         configured_ckpt_dir = training_configs.get('checkpoint_dir', None)
         if configured_ckpt_dir:
@@ -259,8 +275,16 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None):
             print(f"Warning: failed to save tokenizer: {e}")
 
         # No separate test set: evaluation can be performed on validation set or with a separate script.
+        
+        # Get the best f-max score from checkpoint callback
+        best_score = getattr(checkpoint_cb, 'best_model_score', None)
+        if best_score is not None:
+            best_score = best_score.item() if hasattr(best_score, 'item') else float(best_score)
+        else:
+            best_score = 0.0
+        print(f"Best validation F-max score: {best_score:.4f}")
 
-        return model, trainer
+        return model, trainer, best_score
 
 
 if __name__ == "__main__":
@@ -276,7 +300,7 @@ if __name__ == "__main__":
     # run training
     run_name = args.run_name
     resume_from_checkpoint = args.resume
-    train_from_configs(configs, run_name=run_name, resume_from_checkpoint=resume_from_checkpoint)
-
+    model, trainer, best_score = train_from_configs(configs, run_name=run_name, resume_from_checkpoint=resume_from_checkpoint)
+    print(f"\nTraining completed with best F-max: {best_score:.4f}")
 
 
