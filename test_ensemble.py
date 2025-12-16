@@ -8,6 +8,7 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 import warnings
 warnings.filterwarnings('ignore')
+from sklearn.metrics import precision_score, recall_score, accuracy_score, f1_score
 
 from tqdm import tqdm
 from Dataset.Utils import prepare_data_range, read_fasta
@@ -215,6 +216,122 @@ def predict_ensemble(ensemble_dir, test_embeds, test_ids, device='cuda', batch_s
     return predictions_dict, all_predictions, all_terms, all_models_info
 
 
+def calculate_fmax(y_true, y_pred_probs, thresholds=None):
+    """
+    Calculate F-max score by trying different thresholds.
+    
+    Args:
+        y_true: Binary labels (N, num_classes)
+        y_pred_probs: Predicted probabilities (N, num_classes)
+        thresholds: List of thresholds to try (default: 0.01 to 0.99 with step 0.01)
+    
+    Returns:
+        fmax: Maximum F1 score
+        best_threshold: Threshold that achieved fmax
+    """
+    if thresholds is None:
+        thresholds = np.arange(0.01, 1.0, 0.01)
+    
+    fmax = 0.0
+    best_threshold = 0.0
+    
+    for threshold in thresholds:
+        y_pred = (y_pred_probs >= threshold).astype(int)
+        
+        # Calculate F1 for this threshold (macro average)
+        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        
+        if f1 > fmax:
+            fmax = f1
+            best_threshold = threshold
+    
+    return fmax, best_threshold
+
+
+def evaluate_predictions(predictions, test_ids, terms, terms_df):
+    """
+    Evaluate predictions against ground truth labels.
+    
+    Args:
+        predictions: Predicted probabilities (N, num_terms)
+        test_ids: Test IDs (N,)
+        terms: List of GO terms
+        terms_df: DataFrame with columns ['EntryID', 'term'] containing ground truth
+    
+    Returns:
+        metrics: Dictionary with evaluation metrics
+    """
+    print("\n" + "="*60)
+    print("Evaluating Predictions")
+    print("="*60)
+    
+    # Create ground truth matrix
+    y_true = np.zeros((len(test_ids), len(terms)), dtype=int)
+    
+    # Map test_ids to indices
+    id_to_idx = {protein_id: i for i, protein_id in enumerate(test_ids)}
+    term_to_idx = {term: i for i, term in enumerate(terms)}
+    
+    # Fill ground truth matrix
+    print("Building ground truth matrix...")
+    for _, row in tqdm(terms_df.iterrows(), total=len(terms_df)):
+        entry_id = row['EntryID']
+        term = row['term']
+        
+        if entry_id in id_to_idx and term in term_to_idx:
+            y_true[id_to_idx[entry_id], term_to_idx[term]] = 1
+    
+    print(f"Ground truth matrix shape: {y_true.shape}")
+    print(f"Total positive labels: {y_true.sum()}")
+    print(f"Label density: {y_true.sum() / y_true.size * 100:.2f}%")
+    
+    # Calculate F-max
+    print("\nCalculating F-max...")
+    fmax, best_threshold = calculate_fmax(y_true, predictions)
+    
+    # Calculate metrics at best threshold
+    y_pred = (predictions >= best_threshold).astype(int)
+    
+    accuracy = accuracy_score(y_true.flatten(), y_pred.flatten())
+    precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    precision_micro = precision_score(y_true.flatten(), y_pred.flatten(), zero_division=0)
+    recall_micro = recall_score(y_true.flatten(), y_pred.flatten(), zero_division=0)
+    f1_micro = f1_score(y_true.flatten(), y_pred.flatten(), zero_division=0)
+    
+    metrics = {
+        'fmax': fmax,
+        'best_threshold': best_threshold,
+        'accuracy': accuracy,
+        'precision_macro': precision_macro,
+        'recall_macro': recall_macro,
+        'f1_macro': f1_macro,
+        'precision_micro': precision_micro,
+        'recall_micro': recall_micro,
+        'f1_micro': f1_micro
+    }
+    
+    # Print results
+    print("\n" + "="*60)
+    print("Evaluation Results")
+    print("="*60)
+    print(f"F-max:                  {fmax:.4f} (at threshold={best_threshold:.3f})")
+    print(f"Accuracy:               {accuracy:.4f}")
+    print("\nMacro-averaged metrics:")
+    print(f"  Precision:            {precision_macro:.4f}")
+    print(f"  Recall:               {recall_macro:.4f}")
+    print(f"  F1-score:             {f1_macro:.4f}")
+    print("\nMicro-averaged metrics:")
+    print(f"  Precision:            {precision_micro:.4f}")
+    print(f"  Recall:               {recall_micro:.4f}")
+    print(f"  F1-score:             {f1_micro:.4f}")
+    print("="*60 + "\n")
+    
+    return metrics
+
+
 def save_predictions(predictions, test_ids, terms, output_path, threshold=0.01):
     """
     Save predictions with 3 columns: EntryID, Prediction Term, probability.
@@ -264,6 +381,8 @@ if __name__ == "__main__":
                         help='Device to run on (cuda or cpu)')
     parser.add_argument('--threshold', type=float, default=0.01,
                         help='Minimum probability threshold for saving predictions (default: 0.01)')
+    parser.add_argument('--terms_df', type=str, default=None,
+                        help='Path to terms TSV file with ground truth labels (columns: EntryID, term) for evaluation')
     
     args = parser.parse_args()
     
@@ -292,6 +411,22 @@ if __name__ == "__main__":
         device=device,
         batch_size=args.batch_size
     )
+    
+    # Evaluate if ground truth is provided
+    if args.terms_df is not None:
+        print(f"\nLoading ground truth from {args.terms_df}...")
+        terms_df = pd.read_csv(args.terms_df, sep='\t')
+        print(f"Ground truth loaded. Shape: {terms_df.shape}")
+        print(f"Columns: {list(terms_df.columns)}")
+        
+        # Evaluate predictions
+        metrics = evaluate_predictions(all_predictions, test_ids, all_terms, terms_df)
+        
+        # Save metrics to JSON
+        metrics_path = args.output.replace('.tsv', '_metrics.json')
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Saved evaluation metrics to {metrics_path}")
     
     # Save predictions
     save_predictions(all_predictions, test_ids, all_terms, args.output, threshold=args.threshold)
