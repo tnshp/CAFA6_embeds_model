@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from Utils.AsymetricLoss import AsymmetricLossOptimized, AsymmetricLoss
+from Utils.RankLoss import RankLossPair
 from Model.Query2Label import Query2Label
 import numpy as np
 import math
@@ -67,8 +68,14 @@ class Query2Label_pl(pl.LightningModule):
         elif lf in ('BCE', 'BCEWITHLOGITS', 'BCEWITHLOGITSLOSS'):
             # Use BCEWithLogitsLoss; set reduction='sum' to match ASL sum-based scale
             self.criterion = nn.BCEWithLogitsLoss(reduction='sum')
+        elif lf in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
+            # RankLoss uses RankLossPair class
+            self.criterion = RankLossPair(reduction='mean')
         else:
-            raise ValueError(f"Unsupported loss_function: {loss_function}. Supported: 'ASL', 'BCE'.")
+            raise ValueError(f"Unsupported loss_function: {loss_function}. Supported: 'ASL', 'BCE', 'RankLoss'.")
+        
+        # Store loss function name for training step
+        self.loss_function = lf
 
         # Store validation step outputs for on_validation_epoch_end
         self.validation_step_outputs = []
@@ -92,7 +99,28 @@ class Query2Label_pl(pl.LightningModule):
         y = batch['label'].float()
 
         logits = self.forward(x)
-        loss = self.criterion(logits, y)
+        
+        # Calculate loss based on loss function type
+        if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
+            # RankLoss: compute loss for each class separately and sum
+            losses = []
+            for class_idx in range(logits.shape[1]):
+                scores = logits[:, class_idx]  # (B,)
+                labels = y[:, class_idx]  # (B,)
+                
+                # Only compute loss if we have both positive and negative samples
+                if labels.sum() > 0 and labels.sum() < len(labels):
+                    class_loss = self.criterion(scores, labels)
+                    losses.append(class_loss)
+            
+            if losses:
+                loss = torch.stack(losses).mean()
+            else:
+                # Fallback to BCE if no valid pairs
+                loss = nn.functional.binary_cross_entropy_with_logits(logits, y, reduction='mean')
+        else:
+            # Standard loss functions (ASL, BCE)
+            loss = self.criterion(logits, y)
 
         # Log loss
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -104,7 +132,28 @@ class Query2Label_pl(pl.LightningModule):
         y = batch['label'].float()
 
         logits = self.forward(x)
-        loss = self.criterion(logits, y)
+        
+        # Calculate loss based on loss function type
+        if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
+            # RankLoss: compute loss for each class separately and sum
+            losses = []
+            for class_idx in range(logits.shape[1]):
+                scores = logits[:, class_idx]  # (B,)
+                labels = y[:, class_idx]  # (B,)
+                
+                # Only compute loss if we have both positive and negative samples
+                if labels.sum() > 0 and labels.sum() < len(labels):
+                    class_loss = self.criterion(scores, labels)
+                    losses.append(class_loss)
+            
+            if losses:
+                loss = torch.stack(losses).mean()
+            else:
+                # Fallback to BCE if no valid pairs
+                loss = nn.functional.binary_cross_entropy_with_logits(logits, y, reduction='mean')
+        else:
+            # Standard loss functions (ASL, BCE)
+            loss = self.criterion(logits, y)
 
         # Log per-step validation loss (will be reduced automatically)
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
