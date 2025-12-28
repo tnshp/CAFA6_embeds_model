@@ -331,7 +331,7 @@ class Query2Label_pl(pl.LightningModule):
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'monitor': 'val_fmax_macro',
+                'monitor': 'val_f1_macro_go',
                 'interval': 'epoch',
                 'frequency': 1,
             },
