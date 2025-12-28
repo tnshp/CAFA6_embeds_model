@@ -54,6 +54,30 @@ def nearly_orthogonal_vectors(N, K, tol=1e-2, max_tries=10, rng=None):
 
     return np.vstack(V)
 
+def generate_orthogonal_vectors_qr(dimension, num_vectors=None):
+    """
+    Generates a set of orthogonal vectors using QR factorization.
+    
+    Args:
+        dimension (int): The dimensionality of the vectors.
+        num_vectors (int, optional): The number of vectors to generate. 
+                                     Defaults to 'dimension' for a full basis.
+    Returns:
+        numpy.ndarray: A matrix where each column is an orthogonal vector.
+    """
+    if num_vectors is None:
+        num_vectors = dimension
+        
+    # Generate a random matrix
+    A = np.random.rand(dimension, num_vectors)
+    
+    # Perform QR factorization
+    # The 'Q' matrix contains the orthogonal columns
+    Q, R = np.linalg.qr(A)
+    
+    # Return the first 'num_vectors' columns of Q
+    return Q[:, :num_vectors]
+
 class EmbedTokenizer(nn.Module):
     def __init__(self, D, d, N, rng=None):  
         super(EmbedTokenizer, self).__init__()
@@ -72,14 +96,14 @@ class EmbedTokenizer(nn.Module):
         if rng is None:
             rng = np.random.default_rng()
 
+        V = generate_orthogonal_vectors_qr(D)
         K = D
-        V = nearly_orthogonal_vectors(D, K, tol=0.01, max_tries=100, rng=rng)
         # Build P as a single tensor of shape (N, d, D) and register as buffer so it's moved with .to()
         P_list = []
         for i in range(N):
-            indices = np.arange(K)
+            indices = np.arange(D)
             sampled_idx = np.random.choice(indices, size=d, replace=False)
-            p = V[sampled_idx]
+            p = V[:, sampled_idx].T
             P_list.append(p)
 
         P_np = np.stack(P_list, axis=0).astype(np.float32)  # (N, d, D)

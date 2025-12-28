@@ -16,10 +16,10 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from Dataset.Utils import prepare_data_range, read_fasta
+from Dataset.Utils import prepare_data
 from Utils.tokenizer import EmbedTokenizer
 from Dataset.Resample import resample
-from Dataset.EmbeddingsDataset import TokenizedEmbeddingsDataset, collate_tokenize
+from Dataset.EmbeddingsDataset import EmbeddingsDataset, collate_tokenize, PrefetchLoader
 from Model.Query2Label_pl import Query2Label_pl
 
 def train_from_configs(configs, run_name=None, resume_from_checkpoint=None, 
@@ -38,47 +38,13 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
             ia_map: pre-loaded information accretion map (optional, will load if None)
             train_seq: pre-loaded training sequences (optional, will load if None)
         """
-        # Set paths and load metadata (only if not provided)
-        data_paths = configs.get('data_paths', {})
-        BASE_PATH = data_paths.get('base_path', "./cafa-6-protein-function-prediction/")
-        
-        if go_graph is None:
-            go_graph = obonet.read_obo(os.path.join(BASE_PATH, 'Train/go-basic.obo'))
-            print(f"Gene Ontology graph loaded with {len(go_graph)} nodes and {len(go_graph.edges)} edges.")
-        
-        if train_terms_df is None:
-            train_terms_df = pd.read_csv(os.path.join(BASE_PATH, 'Train/train_terms.tsv'), sep='\t')
-            print(f"Training terms loaded. Shape: {train_terms_df.shape}")
-        
-        if ia_map is None:
-            train_fasta_path = os.path.join(BASE_PATH, 'Train/train_sequences.fasta')
-            print(f"Training sequences path set: {train_fasta_path}")
-            ia_df = pd.read_csv(os.path.join(BASE_PATH, 'IA.tsv'), sep='\t', header=None, names=['term_id', 'ia_score'])
-            ia_map = dict(zip(ia_df['term_id'], ia_df['ia_score']))
-            print(f"Information Accretion scores loaded for {len(ia_map)} terms.")
-        
-        if train_seq is None:
-            train_fasta_path = os.path.join(BASE_PATH, 'Train/train_sequences.fasta')
-            train_seq = read_fasta(train_fasta_path)
 
-        # configs
+        print("Preparing data...")
+        data = prepare_data(configs.get('data_paths', {}))
+        print("Data preparation complete.")
+
         model_configs = configs.get('model_configs', {})
         training_configs = configs.get('training_configs', {})
-
-        # loading embeddings (only if not provided)
-        if train_embeds is None or train_ids is None:
-            print("Loading training embeddings...")
-            embeds_path = data_paths.get('embeds_path', '/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm2_embeds_cafa5/train_embeddings.npy')
-            ids_path = data_paths.get('ids_path', '/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm2_embeds_cafa5/train_ids.npy')
-
-            train_embeds = np.load(embeds_path, allow_pickle=True) 
-            train_ids = np.load(ids_path, allow_pickle=True)
-            print(f"Training embeddings loaded. Num samples: {train_embeds.shape[0]}, dim: {train_embeds.shape[1:]}")
-
-        # preparing data (use numpy-based prepare_data_range to avoid large pandas DataFrames)
-        k_range = model_configs.get('k_range', [0, 64])
-        data = prepare_data_range(train_terms_df, train_ids, train_embeds, k_range)
-        print(f"Prepared data with {len(data['entries'])} entries and {data['num_classes']} classes for top_k range {k_range}.")
 
         
         # Determine sampling / splitting behavior
@@ -86,14 +52,14 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         val_fraction = float(training_configs.get('val_fraction', 0.3))
         seed = training_configs.get('seed', None)
 
-        all_idx = np.arange(len(data['entries']))
+        all_idx = np.arange(len(data['seq_2_terms']))
 
         if sampling_instances is not None:
             # resample / oversample indices for training (may include repetitions)
             sampled_idx = resample(data, train_terms_df, strategy=training_configs.get('sampling_strategy', ''), I=sampling_instances)
             if not sampled_idx:
                 print("Warning: resample returned no indices (empty). Falling back to using all available indices for training.")
-                sampled_idx = list(range(len(data['entries'])))
+                sampled_idx = list(range(len(data['seq_2_terms'])))
 
             print(f"Resampled {len(sampled_idx)} indices for training (with repetitions).")
 
@@ -120,7 +86,8 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
             print(f"No sampling_instances set: randomly split {len(all_idx)} indices into {len(train_idx)} train and {len(val_idx)} val (val_fraction={val_fraction}).")
 
         # build tokenizer
-        embedding_dim = int(np.asarray(data['embeds'][0]).shape[0])
+        key = next(iter(data['features_embeds']))
+        embedding_dim = int(np.asarray(data['features_embeds'][key]).shape[0])
         token_d = int(model_configs.get('token_dim', 256))
         num_tokens = int(model_configs.get('num_tokens', 100))
         tokenizer = EmbedTokenizer(D=embedding_dim, d=token_d, N=num_tokens)
@@ -132,39 +99,64 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
             pass
 
         # datasets: training uses all unique sampled indices (with repetitions), val uses remaining indices
-        train_dataset = TokenizedEmbeddingsDataset(data, oversample_indices=sampled_idx)
-        val_dataset = TokenizedEmbeddingsDataset(data, oversample_indices=list(val_idx))
+        train_dataset = EmbeddingsDataset(data, oversample_indices=sampled_idx)
+        val_dataset   = EmbeddingsDataset(data, oversample_indices=list(val_idx))
 
         # dataloaders
-        batch_size = int(training_configs.get('batch_size', 32))
+        batch_size  = int(training_configs.get('batch_size', 32))
         num_workers = int(training_configs.get('num_workers', 0))
-        # pin_memory should be False since collate_tokenize moves tensors to device directly
-        pin_memory = False
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                                  pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b, tokenizer, device))
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                                pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b, tokenizer, device))
-        # No test loader (test set removed)
+        # Memory-efficient settings for multi-worker DataLoader
+        # prefetch_factor: reduce from default 2 to save memory
+        # persistent_workers: reuse workers to avoid respawning overhead
+        pin_memory = True if num_workers > 0 else False
+        prefetch_factor = 2 if num_workers > 0 else None
+        persistent_workers = True if num_workers > 0 else False
+        
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=num_workers,
+            pin_memory=pin_memory, 
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            collate_fn=lambda b: collate_tokenize(b)
+        )
+        train_loader = PrefetchLoader(train_loader, device, tokenizer=tokenizer)
+
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor, 
+            persistent_workers=persistent_workers,
+            collate_fn=lambda b: collate_tokenize(b)
+        )
+        val_loader = PrefetchLoader(val_loader, device, tokenizer=tokenizer)
 
         # instantiate model
-        num_classes = data['num_classes']
-        model = Query2Label_pl(num_classes=num_classes, in_dim=token_d,
-                               nheads=model_configs.get('nheads', 8),
+        num_classes = model_configs['max_terms']
+
+        model = Query2Label_pl(num_classes       =num_classes, 
+                               in_dim            =token_d,
+                               nheads            =model_configs.get('nheads', 8),
                                num_encoder_layers=model_configs.get('num_encoder_layers', 1),
                                num_decoder_layers=model_configs.get('num_decoder_layers', 2),
-                               dim_feedforward=model_configs.get('dim_feedforward', 2048),
-                               dropout=model_configs.get('dropout', 0.1),
-                               use_positional_encoding=model_configs.get('use_positional_encoding', True),
-                               lr=training_configs.get('lr', 1e-4),
-                               weight_decay=training_configs.get('weight_decay', 1e-5),
+                               dim_feedforward   =model_configs.get('dim_feedforward', 2048),
+                               dropout           =model_configs.get('dropout', 0.1),
+                          use_positional_encoding=model_configs.get('use_positional_encoding', True),
+                               lr                =training_configs.get('lr', 1e-4),
+                               weight_decay      =training_configs.get('weight_decay', 1e-5),
                                # loss selection
                                loss_function=training_configs.get('loss_function', 'ASL'),
                                # pass asymmetric loss params from configs
                                gamma_neg=float(training_configs.get('gamma_neg', 4.0)),
                                gamma_pos=float(training_configs.get('gamma_pos', 0.0)),
-                               clip=float(training_configs.get('clip', 0.05)),
-                               loss_eps=float(training_configs.get('loss_eps', 1e-8)),
+                               clip     =float(training_configs.get('clip', 0.05)),
+                               loss_eps =float(training_configs.get('loss_eps', 1e-8)),
                                disable_torch_grad_focal_loss=bool(training_configs.get('disable_torch_grad_focal_loss', True)))
 
         # compute total steps for scheduler and set on model.hparams
@@ -220,18 +212,22 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
 
         # dirpath ensures checkpoints are saved to the requested folder (not the default lightning logs)
         checkpoint_cb = ModelCheckpoint(dirpath=checkpoint_dir,
-                        monitor='val_fmax_macro', mode='max', save_top_k=top_k,
+                        monitor='val_f1_macro_go', mode='max', save_top_k=top_k,
                         save_last=False,
-                        filename='{epoch:02d}-{val_fmax_macro:.4f}')
+                        filename='{epoch:02d}-{val_f1_macro_go:.4f}')
         lr_monitor = LearningRateMonitor(logging_interval='step')
-        # Early stopping: monitor F-max (higher is better)
-        early_stop = EarlyStopping(monitor='val_fmax_macro', patience=int(training_configs.get('patience', 5)), mode='max')
+        # Early stopping: monitor macro F1 (higher is better)
+        early_stop = EarlyStopping(monitor='val_f1_macro_go', patience=int(training_configs.get('patience', 5)), mode='max')
+
+        # Gradient accumulation
+        accumulate_grad_batches = int(training_configs.get('accumulate_grad_batches', 1))
 
         trainer = pl.Trainer(max_epochs=max_epochs,
                              accelerator='auto',
                              devices=training_configs.get('devices', None),
                              logger=logger,
-                             callbacks=[checkpoint_cb, lr_monitor, early_stop])
+                             callbacks=[checkpoint_cb, lr_monitor, early_stop],
+                             accumulate_grad_batches=accumulate_grad_batches)
 
         # train (with optional resume from checkpoint)
         if resume_from_checkpoint is None:
@@ -289,7 +285,7 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Protein GO Classifier with PyTorch Lightning")
-    parser.add_argument('--config', type=str, default='./configs.json', help='Path to config JSON file')
+    parser.add_argument('--config', type=str, default='./configs_new.json', help='Path to config JSON file')
     parser.add_argument('--run_name', type=str, default=None, help='Optional run name for logging')
     parser.add_argument('--resume', type=str, default=None, help='Optional path to checkpoint .ckpt file to resume training from')
     args = parser.parse_args()

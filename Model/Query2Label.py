@@ -71,7 +71,7 @@ class Query2Label(nn.Module):
             e.g. sequence or spatial features from a backbone (ESM, CNN, etc.)
     Output:
         logits: (B, num_classes)
-    """
+    """ 
 
     def __init__(
         self,
@@ -118,27 +118,24 @@ class Query2Label(nn.Module):
             decoder_layer, num_layers=num_decoder_layers
         )
 
-        # Learnable label embeddings as queries (one per class)
-        self.label_queries = nn.Embedding(num_classes, hidden_dim)
-
         # Classification head: individual linear layer for each class
         self.classifier = MultiClassLinear(num_classes, hidden_dim)
 
         self._reset_parameters()
 
     def _reset_parameters(self):
-        # nn.init.xavier_uniform_(self.in_proj.weight)
-        # if self.in_proj.bias is not None:
-        #     nn.init.constant_(self.in_proj.bias, 0.0)
-        nn.init.xavier_uniform_(self.label_queries.weight)
+        # Initialize transformer layers with default PyTorch initialization
         # MultiClassLinear handles its own initialization
+        pass
 
     def forward(
         self,
-        backbone_features: torch.Tensor,
+        query: torch.Tensor, 
+        backbone_features: torch.Tensor, 
         src_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
+        query: (B, num_classes, D) 
         backbone_features: (B, L, C_in)
         src_key_padding_mask: (B, L) with True for padded positions (optional)
 
@@ -158,9 +155,6 @@ class Query2Label(nn.Module):
         memory = self.encoder(
             src, src_key_padding_mask=src_key_padding_mask
         )  # (B, L, D)
-
-        # label queries: (num_classes, D) → (B, num_classes, D)
-        query = self.label_queries.weight.unsqueeze(0).expand(B, -1, -1)
 
         # no causal mask; all labels decoded in parallel
         tgt = query  # (B, num_classes, D)

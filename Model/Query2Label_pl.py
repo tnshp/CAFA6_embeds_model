@@ -81,12 +81,12 @@ class Query2Label_pl(pl.LightningModule):
         self.validation_step_outputs = []
         # Test step outputs
         self.test_step_outputs = []
-        # For F-max computation (store probabilities and targets across val epoch)
-        self._val_probs = []
-        self._val_targets = []
+        # For GO term-based F1 computation (store predictions per GO term)
+        self._val_go_predictions = {}  # {go_term_id: list of probabilities}
+        self._val_go_targets = {}      # {go_term_id: list of binary labels}
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
+    def forward(self, x: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+        return self.model(x, f) 
 
     def training_step(self, batch, batch_idx):
         """Standard training step.
@@ -95,10 +95,11 @@ class Query2Label_pl(pl.LightningModule):
         - `tokens` is a float Tensor of shape (B, L, C_in)
         - `label` is a binary Tensor of shape (B, num_classes)
         """
-        x = batch['tokens']
-        y = batch['label'].float()
+        x = batch['go_embed']   # (B, L, C_in)
+        f = batch['feature']   
+        y = batch['label']
 
-        logits = self.forward(x)
+        logits = self.forward(x, f)
         
         # Calculate loss based on loss function type
         if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
@@ -115,9 +116,6 @@ class Query2Label_pl(pl.LightningModule):
             
             if losses:
                 loss = torch.stack(losses).mean()
-            else:
-                # Fallback to BCE if no valid pairs
-                loss = nn.functional.binary_cross_entropy_with_logits(logits, y, reduction='mean')
         else:
             # Standard loss functions (ASL, BCE)
             loss = self.criterion(logits, y)
@@ -128,10 +126,11 @@ class Query2Label_pl(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         """Validation step computes loss and stores for F-max computation."""
-        x = batch['tokens']
-        y = batch['label'].float()
+        x = batch['go_embed']   # (B, L, C_in)
+        f = batch['feature']   
+        y = batch['label']
 
-        logits = self.forward(x)
+        logits = self.forward(x, f)
         
         # Calculate loss based on loss function type
         if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
@@ -160,13 +159,31 @@ class Query2Label_pl(pl.LightningModule):
 
         # Store for epoch end aggregation
         self.validation_step_outputs.append({'val_loss': loss.detach()})
-        # store probabilities and targets for F-max computation (move to CPU to save GPU memory)
+        
+        # Store GO term-specific predictions for macro/micro F1
         probs = torch.sigmoid(logits)
         targets = (y > 0.5).int()
         try:
-            self._val_probs.append(probs.detach().cpu())
-            self._val_targets.append(targets.detach().cpu())
-        except Exception:
+            probs_np = probs.detach().cpu().numpy()
+            targets_np = targets.detach().cpu().numpy()
+            predicted_terms = batch['predicted_terms']  # List of lists of GO term IDs
+            
+            # For each sample in the batch
+            for sample_idx in range(len(predicted_terms)):
+                sample_terms = predicted_terms[sample_idx]
+                sample_probs = probs_np[sample_idx]  # Shape: (num_terms_for_sample,)
+                sample_targets = targets_np[sample_idx]  # Shape: (num_terms_for_sample,)
+                
+                # For each GO term in this sample
+                for term_idx, go_term in enumerate(sample_terms):
+                    if go_term not in self._val_go_predictions:
+                        self._val_go_predictions[go_term] = []
+                        self._val_go_targets[go_term] = []
+                    
+                    self._val_go_predictions[go_term].append(float(sample_probs[term_idx]))
+                    self._val_go_targets[go_term].append(int(sample_targets[term_idx]))
+        except Exception as e:
+            print(f"Warning: Could not store GO term predictions: {e}")
             pass
 
     def on_validation_epoch_end(self) -> None:
@@ -178,49 +195,26 @@ class Query2Label_pl(pl.LightningModule):
         mean_loss = losses.mean()
 
         self.log('val_loss_epoch', mean_loss, prog_bar=True, logger=True)
-
-        # Compute F-max (best F1 over thresholds) across validation epoch
+        
+        # Compute GO term-based macro and micro F1 scores
         try:
-            if len(self._val_probs) > 0:
-                probs_all = torch.cat(self._val_probs, dim=0)  # (N, C)
-                targets_all = torch.cat(self._val_targets, dim=0)  # (N, C)
-                # thresholds from 0.0 to 1.0 (inclusive)
-                thresholds = torch.linspace(0.0, 1.0, steps=101)
-                C = targets_all.shape[1]
-                per_class_f1_max = torch.zeros(C)
-                eps = 1e-8
-                for t in thresholds:
-                    preds_t = (probs_all > t).int()
-                    tp = (preds_t & targets_all).sum(dim=0).float()
-                    fp = (preds_t & (1 - targets_all)).sum(dim=0).float()
-                    fn = ((1 - preds_t) & targets_all).sum(dim=0).float()
-                    precision = tp / (tp + fp + eps)
-                    recall = tp / (tp + fn + eps)
-                    f1 = 2 * precision * recall / (precision + recall + eps)
-                    # replace NaNs with zeros
-                    f1 = torch.nan_to_num(f1, nan=0.0)
-                    per_class_f1_max = torch.maximum(per_class_f1_max, f1)
-
-                val_fmax_macro = float(per_class_f1_max.mean().item())
-                self.log('val_fmax_macro', val_fmax_macro, prog_bar=True, logger=True)
-                # also log per-class fmax if desired (may be many classes)
-                per_class_dict = {f'val_fmax_class_{i}': float(per_class_f1_max[i].item()) for i in range(per_class_f1_max.numel())}
-                self.log_dict(per_class_dict, prog_bar=False, logger=True)
-                # Print macro F-max to stdout (only on main process)
+            if len(self._val_go_predictions) > 0:
+                macro_f1, micro_f1 = self._compute_go_f1_scores()
+                self.log('val_f1_macro_go', macro_f1, prog_bar=True, logger=True)
+                self.log('val_f1_micro_go', micro_f1, prog_bar=True, logger=True)
+                
                 try:
                     rank = getattr(self, 'global_rank', 0)
                 except Exception:
                     rank = 0
                 if rank == 0:
-                    print(f"Validation Macro F-max: {val_fmax_macro:.4f}")
-                try:
-                    # clear stored buffers
-                    self._val_probs.clear()
-                    self._val_targets.clear()
-                except Exception:
-                    pass
-        except Exception:
-            # if anything goes wrong computing F-max, skip it
+                    print(f"Validation GO-based Macro F1: {macro_f1:.4f}, Micro F1: {micro_f1:.4f}")
+                
+                # Clear GO term buffers
+                self._val_go_predictions.clear()
+                self._val_go_targets.clear()
+        except Exception as e:
+            print(f"Warning: Could not compute GO-based F1 scores: {e}")
             pass
         
         # Clear stored outputs for next epoch
@@ -250,6 +244,60 @@ class Query2Label_pl(pl.LightningModule):
         print(f"Test Loss: {mean_loss:.4f}")
 
         self.test_step_outputs.clear()
+
+    def _compute_go_f1_scores(self, threshold=0.5):
+        """Compute macro and micro F1 scores based on GO term predictions.
+        
+        For each GO term, we have multiple predictions across different samples.
+        Macro F1: Average F1 score across all GO terms
+        Micro F1: F1 score computed from global TP, FP, FN counts
+        """
+        eps = 1e-8
+        per_term_f1_scores = []
+        
+        # Global counts for micro F1
+        global_tp = 0
+        global_fp = 0
+        global_fn = 0
+        
+        # Compute F1 for each GO term
+        for go_term, predictions in self._val_go_predictions.items():
+            targets = self._val_go_targets[go_term]
+            
+            # Convert to numpy for easier computation
+            preds_array = np.array(predictions)
+            targets_array = np.array(targets)
+            
+            # Binarize predictions
+            preds_binary = (preds_array >= threshold).astype(int)
+            
+            # Compute TP, FP, FN for this GO term
+            tp = np.sum((preds_binary == 1) & (targets_array == 1))
+            fp = np.sum((preds_binary == 1) & (targets_array == 0))
+            fn = np.sum((preds_binary == 0) & (targets_array == 1))
+            
+            # Accumulate for micro F1
+            global_tp += tp
+            global_fp += fp
+            global_fn += fn
+            
+            # Compute F1 for this term
+            precision = tp / (tp + fp + eps)
+            recall = tp / (tp + fn + eps)
+            f1 = 2 * precision * recall / (precision + recall + eps)
+            
+            per_term_f1_scores.append(f1)
+        
+        # Compute macro F1 (average across all GO terms)
+        macro_f1 = float(np.mean(per_term_f1_scores)) if per_term_f1_scores else 0.0
+        
+        # Compute micro F1 (global counts)
+        micro_precision = global_tp / (global_tp + global_fp + eps)
+        micro_recall = global_tp / (global_tp + global_fn + eps)
+        micro_f1 = 2 * micro_precision * micro_recall / (micro_precision + micro_recall + eps)
+        micro_f1 = float(micro_f1)
+        
+        return macro_f1, micro_f1
 
     def configure_optimizers(self):
         # Use AdamW; hyperparameters were saved in self.hparams by save_hyperparameters()
