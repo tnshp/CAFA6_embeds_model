@@ -39,12 +39,13 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
             train_seq: pre-loaded training sequences (optional, will load if None)
         """
 
-        print("Preparing data...")
-        data = prepare_data(configs.get('data_paths', {}))
-        print("Data preparation complete.")
 
         model_configs = configs.get('model_configs', {})
         training_configs = configs.get('training_configs', {})
+
+        print(f"Preparing data with aspect {training_configs.get('aspect', None)} max terms {model_configs.get('max_terms', None)}...")
+        data = prepare_data(configs.get('data_paths', {}), max_terms = model_configs.get('max_terms', None), aspect=training_configs.get('aspect', None))
+        print("Data preparation complete.")
 
         
         # Determine sampling / splitting behavior
@@ -106,35 +107,15 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         batch_size  = int(training_configs.get('batch_size', 32))
         num_workers = int(training_configs.get('num_workers', 0))
 
-        # Memory-efficient settings for multi-worker DataLoader
-        # prefetch_factor: reduce from default 2 to save memory
-        # persistent_workers: reuse workers to avoid respawning overhead
+        # pin_memory=True for faster host-to-device transfer when num_workers > 0
+        # Tokenization now happens in PrefetchLoader on GPU, so collate_fn doesn't need device/tokenizer
         pin_memory = True if num_workers > 0 else False
-        prefetch_factor = 2 if num_workers > 0 else None
-        persistent_workers = True if num_workers > 0 else False
-        
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True, 
-            num_workers=num_workers,
-            pin_memory=pin_memory, 
-            prefetch_factor=prefetch_factor,
-            persistent_workers=persistent_workers,
-            collate_fn=lambda b: collate_tokenize(b)
-        )
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                                  pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b))
         train_loader = PrefetchLoader(train_loader, device, tokenizer=tokenizer)
 
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=batch_size, 
-            shuffle=False, 
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            prefetch_factor=prefetch_factor, 
-            persistent_workers=persistent_workers,
-            collate_fn=lambda b: collate_tokenize(b)
-        )
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                                pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b))
         val_loader = PrefetchLoader(val_loader, device, tokenizer=tokenizer)
 
         # instantiate model
@@ -197,6 +178,26 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         run_name_for_ckpt = run_name or training_configs.get('run_name', 'default_run')
         checkpoint_dir = os.path.join(checkpoint_dir, run_name_for_ckpt)
         os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Save tokenizer before training
+        print("Saving tokenizer state...")
+        try:
+            tok_state = tokenizer.state_dict()
+            tok_state_cpu = {k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in tok_state.items()}
+            tokenizer_state_path = os.path.join(checkpoint_dir, 'tokenizer_state_dict.pt')
+            torch.save(tok_state_cpu, tokenizer_state_path)
+            print(f"Saved tokenizer state to: {tokenizer_state_path}")
+
+            # also save the full tokenizer object (pickled) for convenience
+            tokenizer_obj_path = os.path.join(checkpoint_dir, 'tokenizer_object.pt')
+            try:
+                torch.save(tokenizer, tokenizer_obj_path)
+                print(f"Saved tokenizer object to: {tokenizer_obj_path}")
+            except Exception as e:
+                print(f"Warning: Could not save tokenizer object: {e}")
+        except Exception as e:
+            print(f"Warning: failed to save tokenizer: {e}")
+        
         # Save a copy of the configs used for this run into the checkpoint directory
         try:
             configs_path = os.path.join(checkpoint_dir, 'configs.json')
@@ -243,36 +244,7 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         
         trainer.fit(model, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
 
-        # Save tokenizer once (only if a best checkpoint was found)
-        try:
-            best_ckpt = getattr(checkpoint_cb, 'best_model_path', None)
-            if best_ckpt:
-                save_dir = os.path.dirname(best_ckpt)
-                os.makedirs(save_dir, exist_ok=True)
-
-                # state_dict saved with tensors moved to CPU to avoid device issues on load
-                tok_state = tokenizer.state_dict()
-                tok_state_cpu = {k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in tok_state.items()}
-                tokenizer_state_path = os.path.join(save_dir, 'tokenizer_state_dict.pt')
-                torch.save(tok_state_cpu, tokenizer_state_path)
-
-                # also save the full tokenizer object (pickled) for convenience
-                tokenizer_obj_path = os.path.join(save_dir, 'tokenizer_object.pt')
-                try:
-                    torch.save(tokenizer, tokenizer_obj_path)
-                except Exception:
-                    # fallback: save only the state dict if object pickling fails
-                    pass
-
-                print(f"Saved tokenizer state to: {tokenizer_state_path}")
-            else:
-                print("No best checkpoint found; skipping tokenizer save (tokenizer is unchanged during training).")
-        except Exception as e:
-            print(f"Warning: failed to save tokenizer: {e}")
-
-        # No separate test set: evaluation can be performed on validation set or with a separate script.
-        
-        # Get the best f-max score from checkpoint callback
+        # Get best f-max score from checkpoint callback
         best_score = getattr(checkpoint_cb, 'best_model_score', None)
         if best_score is not None:
             best_score = best_score.item() if hasattr(best_score, 'item') else float(best_score)

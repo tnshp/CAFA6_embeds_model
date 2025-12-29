@@ -239,7 +239,7 @@ def pad_dataframe_terms(seq_2_terms_df, go_graph, go_embeds, max_terms=256):
     print(f"Padding complete. Average terms per row: {seq_2_terms_df['terms_predicted'].apply(len).mean():.2f}")
     return seq_2_terms_df
 
-def prepare_data(data_paths, max_terms=256):
+def prepare_data(data_paths, max_terms=256, aspect=None):
     
     knn_terms_df = data_paths['knn_terms_df']
     train_terms_df = data_paths['train_terms_df']
@@ -251,6 +251,8 @@ def prepare_data(data_paths, max_terms=256):
     seq_2_terms = pd.read_parquet(knn_terms_df, engine='fastparquet')
     train_terms = pd.read_csv(train_terms_df, sep='\t')
 
+    term_to_aspect = train_terms.groupby('term')['aspect'].first().to_dict()
+
     go_graph = obonet.read_obo(data_paths['go_obo_path'])
         
     with open(go_embeds_paths, 'rb') as f:
@@ -258,8 +260,22 @@ def prepare_data(data_paths, max_terms=256):
         embeddings_dict = data['embeddings']
         go_ids = data['go_ids']
 
+    # Filter to keep only terms from a specific aspect if aspect is provided
+    if aspect is not None:
+        seq_2_terms['terms_predicted'] = seq_2_terms['terms_predicted'].apply(
+            lambda terms: [t for t in terms if term_to_aspect.get(t) == aspect]
+        )
+        seq_2_terms['terms_true'] = seq_2_terms['terms_true'].apply(
+            lambda terms: [t for t in terms if term_to_aspect.get(t) == aspect]
+        )
+        # Remove rows where terms_predicted or terms_true is now empty
+        seq_2_terms = seq_2_terms[seq_2_terms['terms_predicted'].apply(len) > 0]
+        seq_2_terms = seq_2_terms[seq_2_terms['terms_true'].apply(len) > 0]
+
+
     features_embeds = np.load(features_embeds_path, allow_pickle=True)
     features_ids = np.load(features_ids_path, allow_pickle=True)
+
     features_embeds_dict = {feat_id: embed for feat_id, embed in zip(features_ids, features_embeds)}
 
     # Pad terms_predicted in the dataframe with GO graph neighbors
@@ -269,7 +285,7 @@ def prepare_data(data_paths, max_terms=256):
     term_lengths = seq_2_terms['terms_predicted'].apply(len)
 
     #currently only using sequences with 256 terms, need to change later 
-    seq_2_terms = seq_2_terms[term_lengths == 256]
+    seq_2_terms = seq_2_terms[term_lengths == max_terms]
 
     train_ids =  pd.DataFrame(features_ids, columns=['qseqid'])
     seq_2_terms = seq_2_terms.merge(train_ids, on='qseqid', how='inner')    
@@ -281,4 +297,3 @@ def prepare_data(data_paths, max_terms=256):
            'go_graph': go_graph
            }
     return out
-    

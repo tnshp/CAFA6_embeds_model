@@ -1,426 +1,321 @@
 import torch
-import numpy as np
+from torch.utils.data import DataLoader
 import pandas as pd
+import numpy as np
+import warnings
 import os
 import json
 import argparse
-from pathlib import Path
-from torch.utils.data import DataLoader
-import warnings
-warnings.filterwarnings('ignore')
-from sklearn.metrics import precision_score, recall_score, accuracy_score, f1_score
-from sklearn.preprocessing import MultiLabelBinarizer
 from tqdm import tqdm
 
-from Dataset.EmbeddingsDataset import TokenizedEmbeddingsDataset, collate_tokenize
+warnings.filterwarnings('ignore')
+
+from Dataset.Utils import prepare_data
 from Utils.tokenizer import EmbedTokenizer
+from Dataset.EmbeddingsDataset import EmbeddingsDataset, collate_tokenize, PrefetchLoader
 from Model.Query2Label_pl import Query2Label_pl
 
 
-def prepare_full_test_data(test_ids, test_embeds, top_terms):
+def compute_fmax(predictions_df, ground_truth_df, thresholds=None):
     """
-    Prepare test data for all samples (not filtered by top_terms).
+    Compute F-max score across different thresholds with memory-efficient processing.
     
     Args:
-        test_ids: Array of test IDs
-        test_embeds: Array of test embeddings
-        top_terms: List of GO terms the model was trained on
+        predictions_df: DataFrame with columns ['EntryID', 'term', 'score']
+        ground_truth_df: DataFrame with columns ['EntryID', 'term']
+        thresholds: List of thresholds to try (default: 0.0 to 1.0 in 101 steps)
     
     Returns:
-        data dict compatible with TokenizedEmbeddingsDataset
+        dict with fmax, best_threshold, precision, recall
     """
-    # All test samples are used
-    valid_entries = test_ids
-    valid_embeds = test_embeds
+    if thresholds is None:
+        thresholds = np.linspace(0.0, 1.0, 101)
     
-    # Create dummy labels (zeros) since we're just doing inference
-    labels_binary = np.zeros((len(valid_entries), len(top_terms)))
+    print("Building ground truth dictionary...")
+    # Build ground truth set per EntryID (only once)
+    gt_dict = {}
+    for entry_id, group in ground_truth_df.groupby('EntryID'):
+        gt_dict[entry_id] = set(group['term'].values)
+    
+    print("Pre-sorting predictions by EntryID...")
+    # Sort predictions by EntryID for efficient grouping
+    predictions_sorted = predictions_df.sort_values('EntryID')
+    
+    best_f1 = 0.0
+    best_threshold = 0.5
+    best_precision = 0.0
+    best_recall = 0.0
+    
+    print(f"Testing {len(thresholds)} thresholds...")
+    for idx, threshold in enumerate(tqdm(thresholds, desc="Computing F-max")):
+        tp = 0
+        fp = 0
+        fn = 0
+        
+        # Filter predictions by threshold (memory efficient)
+        pred_above_threshold = predictions_sorted[predictions_sorted['score'] >= threshold]
+        
+        # Build prediction dict only for this threshold
+        pred_dict = {}
+        if len(pred_above_threshold) > 0:
+            for entry_id, group in pred_above_threshold.groupby('EntryID'):
+                pred_dict[entry_id] = set(group['term'].values)
+        
+        # Get all entry IDs (use set from ground truth as baseline)
+        all_entries = set(gt_dict.keys())
+        if len(pred_dict) > 0:
+            all_entries = all_entries | set(pred_dict.keys())
+        
+        # Calculate TP, FP, FN
+        for entry_id in all_entries:
+            true_terms = gt_dict.get(entry_id, set())
+            pred_terms = pred_dict.get(entry_id, set())
+            
+            tp += len(true_terms & pred_terms)
+            fp += len(pred_terms - true_terms)
+            fn += len(true_terms - pred_terms)
+        
+        # Clear pred_dict to free memory
+        del pred_dict
+        del pred_above_threshold
+        
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+            best_precision = precision
+            best_recall = recall
     
     return {
-        'entries': valid_entries,
-        'embeds': valid_embeds,
-        'labels': labels_binary,
-        'top_terms': list(top_terms),
-        'num_classes': len(top_terms)
+        'fmax': best_f1,
+        'threshold': best_threshold,
+        'precision': best_precision,
+        'recall': best_recall
     }
 
 
-def load_model(checkpoint_path, tokenizer_path, configs_path, device='cuda'):
+def test_model(configs, output_path='predictions.tsv', threshold=0.5, calculate_metrics=False):
     """
-    Load a trained model from checkpoint.
+    Test a trained model and generate predictions.
     
     Args:
-        checkpoint_path: Path to the .ckpt file
-        tokenizer_path: Path to tokenizer_state_dict.pt
-        configs_path: Path to configs.json
-        device: Device to load model on
-        
-    Returns:
-        model: Loaded Query2Label_pl model
-        tokenizer: Loaded EmbedTokenizer
-        top_terms: List of GO terms this model predicts
-        configs: Configuration dictionary
-    """
-    print(f"Loading model from {checkpoint_path}")
+        configs: Configuration dictionary with data_paths, model_configs, training_configs
+        output_path: Path to save predictions TSV file
+        threshold: Threshold for filtering predictions (default: 0.5)
+        calculate_metrics: Whether to calculate F-max, precision, recall (requires train_terms_df)
     
-    # Load configs
-    with open(configs_path, 'r') as f:
-        configs = json.load(f)
+    Returns:
+        predictions_df: DataFrame with EntryID, term, score columns
+    """
+    
+    print("Loading data...")
+    data_paths = configs.get('data_paths', {})
+    model_configs = configs.get('model_configs', {})
+    training_configs = configs.get('training_configs', {})
+    
+    # Prepare data
+    max_terms = model_configs.get('max_terms', 256)
+    data = prepare_data(data_paths, max_terms=max_terms)
+    print("Data preparation complete.")
+    
+    # Load checkpoint path
+    checkpoint_path = model_configs.get('model_checkpoint')
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        raise ValueError(f"Invalid checkpoint path: {checkpoint_path}")
+    
+    print(f"Loading model from checkpoint: {checkpoint_path}")
+    
+    # Build tokenizer (must match training configuration)
+    key = next(iter(data['features_embeds']))
+    embedding_dim = int(np.asarray(data['features_embeds'][key]).shape[0])
+    token_d = int(model_configs.get('token_dim', 256))
+    num_tokens = int(model_configs.get('num_tokens', 100))
+    tokenizer = EmbedTokenizer(D=embedding_dim, d=token_d, N=num_tokens)
+    
+    # Try to load tokenizer state from config path or checkpoint directory
+    tokenizer_path = model_configs.get('tokenizer_path')
+    if tokenizer_path and os.path.exists(tokenizer_path):
+        print(f"Loading tokenizer from config path: {tokenizer_path}")
+        tokenizer.load_state_dict(torch.load(tokenizer_path, map_location='cpu'))
+    else:
+        # Fall back to checkpoint directory
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        tokenizer_state_path = os.path.join(checkpoint_dir, 'tokenizer_state_dict.pt')
+        if os.path.exists(tokenizer_state_path):
+            print(f"Loading tokenizer from checkpoint directory: {tokenizer_state_path}")
+            tokenizer.load_state_dict(torch.load(tokenizer_state_path, map_location='cpu'))
+        else:
+            print("Warning: Tokenizer state not found, using random initialization")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    tokenizer = tokenizer.to(device)
     
     # Load model from checkpoint
     model = Query2Label_pl.load_from_checkpoint(checkpoint_path)
-    model.eval()
     model = model.to(device)
-    print(f"  Model loaded and moved to {device}")
+    model.eval()
     
-    # Load tokenizer
-    tokenizer_state = torch.load(tokenizer_path, map_location=device)
+    print("Model loaded successfully")
     
-    # Reconstruct tokenizer with correct dimensions
-    if 'fc_in.weight' in tokenizer_state:
-        D = tokenizer_state['fc_in.weight'].shape[1]
-        d = tokenizer_state['fc_in.weight'].shape[0]
-        N = tokenizer_state['tokens'].shape[0]
-    elif 'P_buffer' in tokenizer_state:
-        N = tokenizer_state['P_buffer'].shape[0]
-        d = tokenizer_state['P_buffer'].shape[1]
-        D = tokenizer_state['P_buffer'].shape[2]
-    else:
-        D = configs.get('data_paths', {}).get('embedding_dim', 1280)
-        d = configs['model_configs'].get('token_dim', 256)
-        N = configs['model_configs'].get('num_tokens', 32)
+    # Create dataset (use all data for testing)
+    all_indices = list(range(len(data['seq_2_terms'])))
+    test_dataset = EmbeddingsDataset(data, oversample_indices=all_indices)
     
-    print(f"  Tokenizer dimensions: D={D} (input), d={d} (token), N={N} (num tokens)")
+    batch_size = int(training_configs.get('batch_size', 32))
+    num_workers = int(training_configs.get('num_workers', 0))
     
-    tokenizer = EmbedTokenizer(D=D, d=d, N=N)
-    tokenizer.load_state_dict(tokenizer_state)
-    tokenizer.eval()
-    tokenizer = tokenizer.to(device)
-    
-    # Load top_terms
-    top_terms_path = os.path.join(os.path.dirname(checkpoint_path), 'top_terms.npy')
-    top_terms = np.load(top_terms_path, allow_pickle=True)
-    print(f"  Loaded {len(top_terms)} GO terms")
-    
-    return model, tokenizer, top_terms, configs
-
-
-def predict(model, tokenizer, test_embeds, test_ids, top_terms, device='cuda', batch_size=64):
-    """
-    Make predictions using a single model on the full test set.
-    
-    Args:
-        model: Trained model
-        tokenizer: Trained tokenizer
-        test_embeds: Test embeddings array (N, embed_dim)
-        test_ids: Test IDs array (N,)
-        top_terms: List of GO terms the model predicts
-        device: Device to run on
-        batch_size: Batch size for inference
-        
-    Returns:
-        predictions: Array of shape (N, num_terms) with probabilities
-    """
-    print("\nMaking predictions...")
-    print(f"  Test samples: {len(test_ids)}")
-    print(f"  Predicting for {len(top_terms)} GO terms")
-    
-    # Create dataset for inference
-    data = prepare_full_test_data(test_ids, test_embeds, top_terms)
-    
-    test_dataset = TokenizedEmbeddingsDataset(data, oversample_indices=list(range(len(test_ids))))
     test_loader = DataLoader(
         test_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=False, 
-        collate_fn=lambda b: collate_tokenize(b, tokenizer, device)
+        collate_fn=lambda b: collate_tokenize(b)
     )
+    test_loader = PrefetchLoader(test_loader, device, tokenizer=tokenizer)
     
-    # Make predictions
-    all_logits = []
+    print(f"Running inference on {len(test_dataset)} samples...")
+    
+    # Store predictions - write to temporary file in chunks to avoid memory issues
+    import tempfile
+    temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tsv')
+    temp_path = temp_file.name
+    temp_file.write('EntryID\tterm\tscore\n')  # Write header
+    
+    batch_count = 0
+    total_predictions = 0
+    
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Predicting"):
-            x = batch['tokens']
-            logits = model(x)
-            all_logits.append(logits.cpu())
+        for batch in tqdm(test_loader, desc="Testing"):
+            x = batch['go_embed']
+            f = batch['feature']
+            entry_ids = batch['entryID']
+            predicted_terms = batch['predicted_terms']
+            
+            # Forward pass
+            logits = model(x, f)
+            probs = torch.sigmoid(logits)
+            
+            # Move to CPU and convert to numpy in one go
+            probs_cpu = probs.cpu().numpy()
+            
+            # Collect predictions for each sample in this batch
+            batch_predictions = []
+            for sample_idx in range(len(entry_ids)):
+                entry_id = entry_ids[sample_idx]
+                sample_terms = predicted_terms[sample_idx]
+                sample_probs = probs_cpu[sample_idx]
+                
+                # Create records for each GO term
+                for term_idx, go_term in enumerate(sample_terms):
+                    score = float(sample_probs[term_idx])
+                    batch_predictions.append(f"{entry_id}\t{go_term}\t{score}\n")
+            
+            # Write batch predictions to temp file
+            temp_file.writelines(batch_predictions)
+            total_predictions += len(batch_predictions)
+            
+            # Free memory
+            del logits, probs, probs_cpu, batch_predictions
+            batch_count += 1
+            
+            # Periodic cleanup
+            if batch_count % 10 == 0:
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-    # Concatenate and apply sigmoid to get probabilities
-    all_logits = torch.cat(all_logits, dim=0)
-    all_probs = torch.sigmoid(all_logits).numpy()
+    temp_file.close()
     
-    print(f"  Predictions shape: {all_probs.shape}")
-    return all_probs
-
-
-def calculate_fmax(y_true, y_pred_probs, thresholds=None):
-    """
-    Calculate F-max score by trying different thresholds.
+    print(f"\nGenerated {total_predictions} predictions")
     
-    Args:
-        y_true: Binary labels (N, num_classes)
-        y_pred_probs: Predicted probabilities (N, num_classes)
-        thresholds: List of thresholds to try (default: 0.01 to 0.99 with step 0.01)
+    # Read predictions from temp file and filter by threshold
+    print("Loading and filtering predictions...")
+    predictions_df = pd.read_csv(temp_path, sep='\t')
     
-    Returns:
-        fmax: Maximum F1 score
-        best_threshold: Threshold that achieved fmax
-    """
-    if thresholds is None:
-        thresholds = np.arange(0.01, 1.0, 0.01)
+    print(f"Unique proteins: {predictions_df['EntryID'].nunique()}")
+    print(f"Unique GO terms: {predictions_df['term'].nunique()}")
     
-    fmax = 0.0
-    best_threshold = 0.0
+    # Filter by threshold and save
+    filtered_predictions = predictions_df[predictions_df['score'] >= threshold].copy()
+    print(f"Predictions above threshold {threshold}: {len(filtered_predictions)}")
     
-    for threshold in thresholds:
-        y_pred = (y_pred_probs >= threshold).astype(int)
-        
-        # Calculate F1 for this threshold (macro average)
-        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
-        
-        if f1 > fmax:
-            fmax = f1
-            best_threshold = threshold
+    # Save predictions
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    filtered_predictions.to_csv(output_path, sep='\t', index=False)
+    print(f"Saved predictions to: {output_path}")
     
-    return fmax, best_threshold
-
-
-def evaluate_predictions(predictions, test_ids, terms, terms_df):
-    """
-    Evaluate predictions against ground truth labels.
+    # Clean up temp file
+    try:
+        os.unlink(temp_path)
+    except:
+        pass
     
-    Args:
-        predictions: Predicted probabilities (N, num_terms)
-        test_ids: Test IDs (N,)
-        terms: List of GO terms
-        terms_df: DataFrame with columns ['EntryID', 'term'] containing ground truth
+    # Keep only filtered predictions in memory for metrics
+    # Calculate metrics if requested and train_terms_df is available
+    if calculate_metrics:
+        train_terms_path = data_paths.get('train_terms_df')
+        if train_terms_path and os.path.exists(train_terms_path):
+            print("\n" + "="*60)
+            print("Computing F-max, Precision, and Recall...")
+            print("="*60)
+            
+            ground_truth_df = pd.read_csv(train_terms_path, sep='\t')
+            
+            # Filter ground truth to only include test entries
+            test_entry_ids = set(predictions_df['EntryID'].unique())
+            ground_truth_filtered = ground_truth_df[ground_truth_df['EntryID'].isin(test_entry_ids)]
+            
+            print(f"Ground truth entries: {len(ground_truth_filtered['EntryID'].unique())}")
+            print(f"Ground truth annotations: {len(ground_truth_filtered)}")
+            
+            # Free memory before computing F-max
+            del predictions_df
+            
+            # Compute F-max with only filtered predictions
+            metrics = compute_fmax(filtered_predictions, ground_truth_filtered)
+            
+            print(f"\nResults:")
+            print(f"  F-max:      {metrics['fmax']:.4f}")
+            print(f"  Threshold:  {metrics['threshold']:.4f}")
+            print(f"  Precision:  {metrics['precision']:.4f}")
+            print(f"  Recall:     {metrics['recall']:.4f}")
+            print("="*60)
+            
+            # Save metrics to JSON
+            metrics_path = output_path.replace('.tsv', '_metrics.json')
+            with open(metrics_path, 'w') as f:
+                json.dump(metrics, f, indent=2)
+            print(f"Saved metrics to: {metrics_path}")
+        else:
+            print("\nWarning: train_terms_df not found, skipping metrics calculation")
     
-    Returns:
-        metrics: Dictionary with evaluation metrics
-    """
-    print("\n" + "="*60)
-    print("Evaluating Predictions")
-    print("="*60)
-    
-    # Create ground truth matrix
-    y_true = np.zeros((len(test_ids), len(terms)), dtype=int)
-    
-    # Map test_ids to indices
-    id_to_idx = {protein_id: i for i, protein_id in enumerate(test_ids)}
-    term_to_idx = {term: i for i, term in enumerate(terms)}
-    
-    # Fill ground truth matrix
-    print("Building ground truth matrix...")
-    matched_annotations = 0
-    for _, row in tqdm(terms_df.iterrows(), total=len(terms_df)):
-        entry_id = row['EntryID']
-        term = row['term']
-        
-        if entry_id in id_to_idx and term in term_to_idx:
-            y_true[id_to_idx[entry_id], term_to_idx[term]] = 1
-            matched_annotations += 1
-    
-    print(f"Ground truth matrix shape: {y_true.shape}")
-    print(f"Total annotations in ground truth: {len(terms_df)}")
-    print(f"Matched annotations (in model's term set): {matched_annotations}")
-    print(f"Total positive labels: {y_true.sum()}")
-    print(f"Label density: {y_true.sum() / y_true.size * 100:.4f}%")
-    
-    # Calculate F-max
-    print("\nCalculating F-max...")
-    fmax, best_threshold = calculate_fmax(y_true, predictions)
-    
-    # Calculate metrics at best threshold
-    y_pred = (predictions >= best_threshold).astype(int)
-    
-    accuracy = accuracy_score(y_true.flatten(), y_pred.flatten())
-    precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
-    recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
-    f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    
-    precision_micro = precision_score(y_true.flatten(), y_pred.flatten(), zero_division=0)
-    recall_micro = recall_score(y_true.flatten(), y_pred.flatten(), zero_division=0)
-    f1_micro = f1_score(y_true.flatten(), y_pred.flatten(), zero_division=0)
-    
-    metrics = {
-        'fmax': fmax,
-        'best_threshold': best_threshold,
-        'accuracy': accuracy,
-        'precision_macro': precision_macro,
-        'recall_macro': recall_macro,
-        'f1_macro': f1_macro,
-        'precision_micro': precision_micro,
-        'recall_micro': recall_micro,
-        'f1_micro': f1_micro,
-        'total_annotations': int(len(terms_df)),
-        'matched_annotations': int(matched_annotations),
-        'coverage': matched_annotations / len(terms_df) if len(terms_df) > 0 else 0.0
-    }
-    
-    # Print results
-    print("\n" + "="*60)
-    print("Evaluation Results")
-    print("="*60)
-    print(f"F-max:                  {fmax:.4f} (at threshold={best_threshold:.3f})")
-    print(f"Accuracy:               {accuracy:.4f}")
-    print(f"Coverage:               {metrics['coverage']:.2%} ({matched_annotations}/{len(terms_df)} annotations)")
-    print("\nMacro-averaged metrics:")
-    print(f"  Precision:            {precision_macro:.4f}")
-    print(f"  Recall:               {recall_macro:.4f}")
-    print(f"  F1-score:             {f1_macro:.4f}")
-    print("\nMicro-averaged metrics:")
-    print(f"  Precision:            {precision_micro:.4f}")
-    print(f"  Recall:               {recall_micro:.4f}")
-    print(f"  F1-score:             {f1_micro:.4f}")
-    print("="*60 + "\n")
-    
-    return metrics
-
-
-def save_predictions(predictions, test_ids, terms, output_path, threshold=0.01):
-    """
-    Save predictions with 3 columns: EntryID, Prediction Term, probability.
-    Only entries with probability >= threshold are saved.
-    
-    Args:
-        predictions: Array of shape (N, num_terms)
-        test_ids: Array of test IDs (N,)
-        terms: List of GO terms
-        output_path: Path to save predictions
-        threshold: Minimum probability threshold (default: 0.01)
-    """
-    print(f"\nSaving predictions to {output_path}...")
-    rows = []
-    for i, protein_id in tqdm(enumerate(test_ids), total=len(test_ids), desc="Saving"):
-        for j, term in enumerate(terms):
-            probability = predictions[i, j]
-            if probability >= threshold:
-                rows.append({
-                    'EntryID': protein_id,
-                    'Prediction Term': term,
-                    'probability': probability
-                })
-    
-    df = pd.DataFrame(rows)
-    df.to_csv(output_path, sep='\t', index=False)
-    print(f"Saved {len(df)} predictions (threshold >= {threshold})")
+    return filtered_predictions
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test a single trained model")
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to model checkpoint (.ckpt file)')
-    parser.add_argument('--checkpoint_dir', type=str, default=None,
-                        help='Path to checkpoint directory (contains .ckpt, tokenizer, configs). If provided, will use best checkpoint.')
-    parser.add_argument('--test_embeds', type=str,
-                        default='/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm3_embeds/test_embeds.npy',
-                        help='Path to test embeddings')
-    parser.add_argument('--test_ids', type=str,
-                        default='/mnt/d/ML/Kaggle/CAFA6-new/Dataset/esm3_embeds/test_ids.npy',
-                        help='Path to test IDs')
-    parser.add_argument('--terms_df', type=str, default=None,
-                        help='Path to terms TSV file with ground truth labels (columns: EntryID, term)')
-    parser.add_argument('--output', type=str,
-                        default='./predictions.tsv',
-                        help='Output path for predictions')
-    parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size for inference')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to run on (cuda or cpu)')
-    parser.add_argument('--threshold', type=float, default=0.01,
-                        help='Minimum probability threshold for saving predictions')
-    
+    parser = argparse.ArgumentParser(description="Test Protein GO Classifier")
+    parser.add_argument('--config', type=str, default='./configs_test.json', 
+                        help='Path to test config JSON file')
+    parser.add_argument('--output', type=str, default='./predictions.tsv',
+                        help='Path to save predictions TSV file')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='Threshold for filtering predictions (default: 0.5)')
+    parser.add_argument('--metrics', action='store_true',
+                        help='Calculate F-max, precision, and recall')
     args = parser.parse_args()
     
-    # Check device availability
-    device = args.device
-    if device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA not available, using CPU")
-        device = 'cpu'
+    # Load configs
+    with open(args.config, 'r') as f:
+        configs = json.load(f)
     
-    print(f"Using device: {device}\n")
-    
-    # Determine checkpoint paths
-    if args.checkpoint_dir:
-        checkpoint_dir = Path(args.checkpoint_dir)
-        # Find best checkpoint
-        ckpt_files = list(checkpoint_dir.glob('*.ckpt'))
-        if not ckpt_files:
-            raise ValueError(f"No checkpoint files found in {checkpoint_dir}")
-        
-        # Parse val_fmax_macro from filename and select best
-        best_ckpt = None
-        best_score = -1
-        for ckpt in ckpt_files:
-            try:
-                score_str = ckpt.stem.split('val_fmax_macro=')[1]
-                score = float(score_str)
-                if score > best_score:
-                    best_score = score
-                    best_ckpt = ckpt
-            except:
-                continue
-        
-        if best_ckpt is None:
-            best_ckpt = ckpt_files[0]
-            print(f"Could not parse scores, using {best_ckpt.name}")
-        else:
-            print(f"Using best checkpoint: {best_ckpt.name} (val_fmax_macro={best_score:.4f})")
-        
-        checkpoint_path = str(best_ckpt)
-        tokenizer_path = str(checkpoint_dir / 'tokenizer_state_dict.pt')
-        configs_path = str(checkpoint_dir / 'configs.json')
-        
-        # Check for .tmp config
-        if not Path(configs_path).exists():
-            configs_path = str(checkpoint_dir / 'configs.json.tmp')
-    else:
-        checkpoint_path = args.checkpoint
-        checkpoint_dir = Path(checkpoint_path).parent
-        tokenizer_path = str(checkpoint_dir / 'tokenizer_state_dict.pt')
-        configs_path = str(checkpoint_dir / 'configs.json')
-        
-        if not Path(configs_path).exists():
-            configs_path = str(checkpoint_dir / 'configs.json.tmp')
-    
-    # Load test data
-    print(f"Loading test embeddings from {args.test_embeds}...")
-    test_embeds = np.load(args.test_embeds, allow_pickle=True)
-    print(f"  Shape: {test_embeds.shape}")
-    
-    print(f"Loading test IDs from {args.test_ids}...")
-    test_ids = np.load(args.test_ids, allow_pickle=True)
-    print(f"  Shape: {test_ids.shape}\n")
-    
-    # Load model
-    model, tokenizer, top_terms, configs = load_model(
-        checkpoint_path, tokenizer_path, configs_path, device
+    # Run testing
+    predictions_df = test_model(
+        configs, 
+        output_path=args.output,
+        threshold=args.threshold,
+        calculate_metrics=args.metrics
     )
     
-    # Make predictions
-    predictions = predict(
-        model, tokenizer, test_embeds, test_ids, top_terms,
-        device=device, batch_size=args.batch_size
-    )
-    
-    # Evaluate if ground truth is provided
-    if args.terms_df is not None:
-        print(f"\nLoading ground truth from {args.terms_df}...")
-        terms_df = pd.read_csv(args.terms_df, sep='\t')
-        print(f"  Shape: {terms_df.shape}")
-        print(f"  Columns: {list(terms_df.columns)}")
-        
-        # Evaluate predictions
-        metrics = evaluate_predictions(predictions, test_ids, top_terms, terms_df)
-        
-        # Save metrics to JSON
-        metrics_path = args.output.replace('.tsv', '_metrics.json')
-        with open(metrics_path, 'w') as f:
-            json.dump(metrics, f, indent=2)
-        print(f"Saved evaluation metrics to {metrics_path}\n")
-    
-    # Save predictions
-    save_predictions(predictions, test_ids, top_terms, args.output, threshold=args.threshold)
-    
-    print("\nTest complete!")
+    print("\nTesting completed successfully!")
