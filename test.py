@@ -118,7 +118,10 @@ def test_model(configs, output_path='predictions.tsv', threshold=0.5, calculate_
     
     # Prepare data
     max_terms = model_configs.get('max_terms', 256)
-    data = prepare_data(data_paths, max_terms=max_terms)
+    aspect = training_configs.get('aspect', None)
+
+    print(f"Preparing data with max_terms={max_terms}, aspect={aspect}...")
+    data = prepare_data(data_paths, max_terms=max_terms, aspect=aspect)
     print("Data preparation complete.")
     
     # Load checkpoint path
