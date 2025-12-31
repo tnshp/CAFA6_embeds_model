@@ -308,8 +308,12 @@ if __name__ == "__main__":
     parser.add_argument('--metrics', action='store_true',
                         help='Calculate F-max, precision, and recall')
     args = parser.parse_args()
-    
-    # Load configs
+        
+    #test configs
+    # with open(args.config, 'r') as f:
+    #     test_configs = json.load(f)
+    # # Load configs
+
     with open(args.config, 'r') as f:
         configs = json.load(f)
     

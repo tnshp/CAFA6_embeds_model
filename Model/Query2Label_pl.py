@@ -84,6 +84,8 @@ class Query2Label_pl(pl.LightningModule):
         # For GO term-based F1 computation (store predictions per GO term)
         self._val_go_predictions = {}  # {go_term_id: list of probabilities}
         self._val_go_targets = {}      # {go_term_id: list of binary labels}
+        self._rank_score_list = []
+        self._cutoff_score_list = []
 
     def forward(self, x: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
         return self.model(x, f) 
@@ -156,7 +158,7 @@ class Query2Label_pl(pl.LightningModule):
 
         # Log per-step validation loss (will be reduced automatically)
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
+        
         # Store for epoch end aggregation
         self.validation_step_outputs.append({'val_loss': loss.detach()})
         
@@ -168,6 +170,13 @@ class Query2Label_pl(pl.LightningModule):
             targets_np = targets.detach().cpu().numpy()
             predicted_terms = batch['predicted_terms']  # List of lists of GO term IDs
             
+            #Calculate rankscore and cutoff score
+            rank_score = self._compute_rank_score(probs_np, targets_np, predicted_terms)
+            cutoff_score = self._compute_cutoff_score(probs_np, targets_np, predicted_terms)
+
+            self._rank_score_list.append(rank_score)
+            self._cutoff_score_list.append(cutoff_score)
+
             # For each sample in the batch
             for sample_idx in range(len(predicted_terms)):
                 sample_terms = predicted_terms[sample_idx]
@@ -194,8 +203,15 @@ class Query2Label_pl(pl.LightningModule):
         losses = torch.stack([o['val_loss'] for o in self.validation_step_outputs])
         mean_loss = losses.mean()
 
+        
         self.log('val_loss_epoch', mean_loss, prog_bar=True, logger=True)
         
+        mean_rank_score = float(np.mean(self._rank_score_list)) if self._rank_score_list else 0.0
+        mean_cutoff_score = float(np.mean(self._cutoff_score_list)) if self._cutoff_score_list else 0.0
+        self.log('val_rank_score', mean_rank_score, prog_bar=True, logger=True)
+        self.log('val_cutoff_score', mean_cutoff_score, prog_bar=True, logger=True)
+
+
         # Compute GO term-based macro and micro F1 scores
         try:
             if len(self._val_go_predictions) > 0:
@@ -208,11 +224,14 @@ class Query2Label_pl(pl.LightningModule):
                 except Exception:
                     rank = 0
                 if rank == 0:
-                    print(f"Validation GO-based Macro F1: {macro_f1:.4f}, Micro F1: {micro_f1:.4f}")
+                    print(f"Validation GO-based Macro F1: {macro_f1:.4f}, Micro F1: {micro_f1:.4f}, Rank Score: {mean_rank_score:.4f}, Cutoff Score: {mean_cutoff_score:.4f}")
                 
                 # Clear GO term buffers
                 self._val_go_predictions.clear()
                 self._val_go_targets.clear()
+                self._rank_score_list.clear()
+                self._cutoff_score_list.clear()
+                
         except Exception as e:
             print(f"Warning: Could not compute GO-based F1 scores: {e}")
             pass
@@ -244,6 +263,82 @@ class Query2Label_pl(pl.LightningModule):
         print(f"Test Loss: {mean_loss:.4f}")
 
         self.test_step_outputs.clear()
+
+    def _compute_rank_score(self, probs_np, targets_np, predicted_terms):
+        """Compute rank score based on GO term predictions.
+        
+        For each instance:
+        1. Threshold = number of positive labels
+        2. Sort predictions in descending order
+        3. Count how many true labels are in top `threshold` positions
+        4. Score = (true labels in top k) / (total true labels)
+        """
+        batch_scores = []
+        
+        for sample_idx in range(len(probs_np)):
+            sample_probs = probs_np[sample_idx]
+            sample_targets = targets_np[sample_idx]
+            
+            # Threshold is the number of positive labels
+            num_positives = int(sample_targets.sum())
+            
+            # Skip if no positives
+            if num_positives == 0:
+                continue
+            
+            # Get indices of predictions sorted in descending order
+            sorted_indices = np.argsort(sample_probs)[::-1]
+            
+            # Get top k indices where k = number of positive labels
+            top_k_indices = sorted_indices[:num_positives]
+            
+            # Check how many of the top k predictions are true positives
+            true_positives_in_top_k = sample_targets[top_k_indices].sum()
+            
+            # Calculate score for this sample
+            score = true_positives_in_top_k / num_positives
+            batch_scores.append(score)
+        
+        # Return average score across all samples in batch
+        return float(np.mean(batch_scores)) if batch_scores else 0.0
+        
+
+    def _compute_cutoff_score(self, probs_np, targets_np, predicted_terms):
+        """Compute cutoff score based on GO term predictions.
+        
+        For each instance:
+        1. Sort predictions in descending order
+        2. Find the index of the last (lowest ranked) true label
+        3. That index is the cutoff score
+        """
+        batch_scores = []
+        
+        for sample_idx in range(len(probs_np)):
+            sample_probs = probs_np[sample_idx]
+            sample_targets = targets_np[sample_idx]
+            
+            # Skip if no positives
+            num_positives = int(sample_targets.sum())
+            if num_positives == 0:
+                continue
+            
+            # Get indices of predictions sorted in descending order
+            sorted_indices = np.argsort(sample_probs)[::-1]
+            
+            # Find positions of true labels in the sorted order
+            true_label_positions = []
+            for idx, sorted_idx in enumerate(sorted_indices):
+                if sample_targets[sorted_idx] == 1:
+                    true_label_positions.append(idx)
+            
+            # The cutoff score is the index of the last true label
+            if true_label_positions:
+                cutoff_score = max(true_label_positions)
+                batch_scores.append(cutoff_score)
+        
+        # Return average score across all samples in batch
+        return float(np.mean(batch_scores)) if batch_scores else 0.0
+
 
     def _compute_go_f1_scores(self, threshold=0.5):
         """Compute macro and micro F1 scores based on GO term predictions.
@@ -298,6 +393,7 @@ class Query2Label_pl(pl.LightningModule):
         micro_f1 = float(micro_f1)
         
         return macro_f1, micro_f1
+        
 
     def configure_optimizers(self):
         # Use AdamW; hyperparameters were saved in self.hparams by save_hyperparameters()
