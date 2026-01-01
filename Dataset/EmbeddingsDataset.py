@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
+
 class EmbeddingsDataset(Dataset):
     """Dataset that yields raw embeddings; tokenization is done in collate_fn for batching."""
     def __init__(self, 
@@ -27,7 +28,7 @@ class EmbeddingsDataset(Dataset):
         row = self.data['seq_2_terms'].iloc[sample_idx]
         qseqid = row['qseqid']
 
-        feature_embed = self.data['features_embeds'][qseqid]
+        sequence = self.data['sequences'][qseqid]
 
         true_terms_set = set(row['terms_true'])
         predicted_terms = row['terms_predicted']
@@ -41,7 +42,7 @@ class EmbeddingsDataset(Dataset):
         
         return {
             'entryID'   : qseqid,
-            'feature'   : feature_embed,
+            'sequence'   : sequence,
             'go_embed'  : go_embeds,
             'label'     : label,
             'predicted_terms': valid_terms,
@@ -50,42 +51,29 @@ class EmbeddingsDataset(Dataset):
 
 
 
-def collate_tokenize(batch, tokenizer=None, device=None, dtype=torch.float32):
+def collate_tokenize(batch, tokenizer, device=None, dtype=torch.float32):
     """Custom collate function to handle variable-length data.
     
     Args:
         batch: List of samples from the dataset
-        tokenizer: Tokenizer to apply to features (if None, tokenization happens later)
-        device: Device to move tensors to (cuda or cpu) - DEPRECATED, use None for multi-worker support
+        tokenizer: Tokenizer to apply to features
+        device: Device to move tensors to (cuda or cpu)
         dtype: Target dtype for tensors (torch.float32, torch.float16, or torch.bfloat16)
-    
-    Note: For multi-worker DataLoader support (num_workers > 0), keep device=None and 
-          move tensors to GPU after collation using PrefetchLoader or in training loop.
     """
-    features = torch.stack([torch.from_numpy(item['feature']) for item in batch])
-    features = features.to(dtype=dtype)
-    
-    # Only tokenize if tokenizer is provided and on CPU
-    # For multi-worker support, tokenization should happen after collation
-    if tokenizer is not None:
-        # Move tokenizer to CPU if needed for worker compatibility
-        if hasattr(tokenizer, 'P_buffer') and tokenizer.P_buffer.device.type != 'cpu':
-            # Tokenizer is on GPU, which doesn't work with workers
-            # Skip tokenization here - it will be done in PrefetchLoader
-            pass
-        else:
-            features = tokenizer(features)
+    sequences = [item['sequence'] for item in batch]
+    # sequences = sequences.to(dtype=dtype, device=device) if device else sequences.to(dtype=dtype)
+    enc_input = tokenizer(sequences, return_tensors="pt", padding=True, truncation=True, max_length=1024)
+    enc_input = {k: v.to(device) for k, v in enc_input.items()}
     
     go_embed = torch.stack([torch.from_numpy(item['go_embed']) for item in batch])
-    go_embed = go_embed.to(dtype=dtype)
+    go_embed = go_embed.to(dtype=dtype, device=device) if device else go_embed.to(dtype=dtype)
     
     label = torch.stack([torch.from_numpy(item['label']) for item in batch])
-    label = label.to(dtype=dtype)
+    label = label.to(dtype=dtype, device=device) if device else label.to(dtype=dtype)
     
-    # Don't move to device here - let PrefetchLoader handle it
     return {
         'entryID': [item['entryID'] for item in batch],
-        'feature': features,
+        'enc_input': enc_input,
         'go_embed': go_embed,
         'label': label,
         'predicted_terms': [item['predicted_terms'] for item in batch],
@@ -98,14 +86,10 @@ class PrefetchLoader:
     Prefetch loader that loads batches asynchronously to GPU for faster training.
     Overlaps data transfer with computation by loading the next batch while 
     the model processes the current batch.
-    
-    Also handles tokenization on GPU if tokenizer is provided.
     """
-    def __init__(self, dataloader, device, tokenizer=None, max_prefetch=1):
+    def __init__(self, dataloader, device):
         self.dataloader = dataloader
         self.device = device
-        self.tokenizer = tokenizer
-        self.max_prefetch = max_prefetch  # Limit prefetching to reduce memory usage
         self.stream = torch.cuda.Stream() if device.type == 'cuda' else None
         
     def __iter__(self):
@@ -117,7 +101,7 @@ class PrefetchLoader:
             return iter(self.dataloader)
     
     def _cuda_iter(self):
-        """Iterator with CUDA stream prefetching and memory management."""
+        """Iterator with CUDA stream prefetching."""
         loader_iter = iter(self.dataloader)
         
         # Preload first batch
@@ -146,29 +130,15 @@ class PrefetchLoader:
                     next_batch = self._to_device(next_batch)
             except StopIteration:
                 yield batch
-                # Clean up
-                del batch
                 break
-                
+                    
             yield batch
-            # Free memory from previous batch
-            del batch
     
     def _to_device(self, batch):
-        """Move batch to device and apply tokenization if needed."""
+        """Move batch to device (already moved in collate_fn, but ensure it's there)."""
         if isinstance(batch, dict):
-            result = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    result[k] = v.to(device=self.device, non_blocking=True)
-                else:
-                    result[k] = v
-            
-            # Apply tokenizer on GPU after moving to device
-            if self.tokenizer is not None and 'feature' in result:
-                result['feature'] = self.tokenizer(result['feature'])
-            
-            return result
+            # Batch is already on device from collate_fn, just return it
+            return batch
         return batch
     
     def __len__(self):

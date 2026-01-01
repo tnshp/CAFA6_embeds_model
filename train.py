@@ -1,23 +1,23 @@
 
 import torch
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
-import pandas as pd
-import numpy as np
-import warnings
-import obonet
-import os
 import json
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModel
 import argparse
+import os
+import sys
+import warnings
+import numpy as np
+from datetime import datetime
+import torch.nn as nn
+import pytorch_lightning as pl
 
 warnings.filterwarnings('ignore')
 
-import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from Dataset.Utils import prepare_data
-from Utils.tokenizer import EmbedTokenizer
 # from Dataset.Resample import resample
 from Dataset.EmbeddingsDataset import EmbeddingsDataset, collate_tokenize, PrefetchLoader
 from Model.Query2Label_pl import Query2Label_pl
@@ -86,28 +86,30 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
 
             print(f"No sampling_instances set: randomly split {len(all_idx)} indices into {len(train_idx)} train and {len(val_idx)} val (val_fraction={val_fraction}).")
 
-        # build tokenizer
-        key = next(iter(data['features_embeds']))
-        embedding_dim = int(np.asarray(data['features_embeds'][key]).shape[0])
-        token_d = int(model_configs.get('token_dim', 256))
-        num_tokens = int(model_configs.get('num_tokens', 100))
-        tokenizer = EmbedTokenizer(D=embedding_dim, d=token_d, N=num_tokens)
-
+        # Load ESM model and tokenizer
+        esm_model_name = model_configs.get('esm_model_name', 'facebook/esm2_t33_650M_UR50D')
+        max_sequence_length = model_configs.get('max_sequence_length', 1024)
+        
+        print(f"Loading ESM model: {esm_model_name}...")
+        esm_tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
+        esm_model = AutoModel.from_pretrained(esm_model_name)
+        
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        try:
-            tokenizer = tokenizer.to(device)
-        except Exception:
-            pass
-
-        # Freeze or unfreeze tokenizer parameters based on config
-        freeze_tokenizer = training_configs.get('freeze_tokenizer', True)
-        if freeze_tokenizer:
-            print("Freezing tokenizer parameters...")
-            for param in tokenizer.parameters():
+        esm_model = esm_model.to(device)
+        
+        # Get ESM model output dimension
+        esm_output_dim = esm_model.config.hidden_size
+        print(f"ESM model output dimension: {esm_output_dim}")
+        
+        # Freeze or unfreeze ESM model parameters based on config
+        freeze_feature_encoder = training_configs.get('freeze_feature_encoder', True)
+        if freeze_feature_encoder:
+            print("Freezing ESM model parameters...")
+            for param in esm_model.parameters():
                 param.requires_grad = False
         else:
-            print("Tokenizer parameters will be trained...")
-            for param in tokenizer.parameters():
+            print("ESM model parameters will be trained...")
+            for param in esm_model.parameters():
                 param.requires_grad = True
 
         # datasets: training uses all unique sampled indices (with repetitions), val uses remaining indices
@@ -119,20 +121,23 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         num_workers = int(training_configs.get('num_workers', 0))
 
         # pin_memory=True for faster host-to-device transfer when num_workers > 0
-        # Tokenization now happens in PrefetchLoader on GPU, so collate_fn doesn't need device/tokenizer
+        # Tokenization happens in collate_fn using ESM tokenizer
         pin_memory = True if num_workers > 0 else False
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                                  pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b))
-        train_loader = PrefetchLoader(train_loader, device, tokenizer=tokenizer)
+                                  pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b, esm_tokenizer, device))
+        train_loader = PrefetchLoader(train_loader, device)
 
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                                pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b))
-        val_loader = PrefetchLoader(val_loader, device, tokenizer=tokenizer)
+                                pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b, esm_tokenizer, device))
+        val_loader = PrefetchLoader(val_loader, device)
 
         # instantiate model
         num_classes = model_configs['max_terms']
+        token_d = int(model_configs.get('token_dim', 512))
 
-        model = Query2Label_pl(num_classes       =num_classes, 
+        model = Query2Label_pl(feature_encoder    =esm_model,
+                               feature_encoder_output_dim=esm_output_dim,
+                               num_classes       =num_classes, 
                                in_dim            =token_d,
                                nheads            =model_configs.get('nheads', 8),
                                num_encoder_layers=model_configs.get('num_encoder_layers', 1),
@@ -189,25 +194,6 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         run_name_for_ckpt = run_name or training_configs.get('run_name', 'default_run')
         checkpoint_dir = os.path.join(checkpoint_dir, run_name_for_ckpt)
         os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        # Save tokenizer before training
-        print("Saving tokenizer state...")
-        try:
-            tok_state = tokenizer.state_dict()
-            tok_state_cpu = {k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in tok_state.items()}
-            tokenizer_state_path = os.path.join(checkpoint_dir, 'tokenizer_state_dict.pt')
-            torch.save(tok_state_cpu, tokenizer_state_path)
-            print(f"Saved tokenizer state to: {tokenizer_state_path}")
-
-            # also save the full tokenizer object (pickled) for convenience
-            tokenizer_obj_path = os.path.join(checkpoint_dir, 'tokenizer_object.pt')
-            try:
-                torch.save(tokenizer, tokenizer_obj_path)
-                print(f"Saved tokenizer object to: {tokenizer_obj_path}")
-            except Exception as e:
-                print(f"Warning: Could not save tokenizer object: {e}")
-        except Exception as e:
-            print(f"Warning: failed to save tokenizer: {e}")
         
         # Save a copy of the configs used for this run into the checkpoint directory
         try:
@@ -268,7 +254,7 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Protein GO Classifier with PyTorch Lightning")
-    parser.add_argument('--config', type=str, default='./configs_new.json', help='Path to config JSON file')
+    parser.add_argument('--config', type=str, default='./configs.json', help='Path to config JSON file')
     parser.add_argument('--run_name', type=str, default=None, help='Optional run name for logging')
     parser.add_argument('--resume', type=str, default=None, help='Optional path to checkpoint .ckpt file to resume training from')
     args = parser.parse_args()

@@ -2,6 +2,42 @@ import numpy as np
 import pandas as pd
 import pickle
 import obonet
+from typing import Dict, List
+
+
+def get_class_frequencies_from_dataframe(train_term_df, top_terms):
+
+    from collections import Counter
+
+    # Count frequency of each term
+    term_counts = Counter(train_term_df['term'])
+
+    # Get frequencies for top_terms in order
+    class_frequencies = np.array([term_counts[term] for term in top_terms])
+
+    return class_frequencies
+
+
+def read_fasta(path: str) -> Dict[str, str]:
+    seqs = {}
+    with open(path, "r") as f:
+        pid = None; seq_parts = []
+        for line in f:
+            line=line.strip()
+            if line.startswith(">"):
+                if pid: seqs[pid] = "".join(seq_parts)
+                header=line[1:].split()[0]
+                if "|" in header:
+                    parts=header.split("|"); pid = parts[1] if len(parts)>=2 else header
+                else:
+                    pid = header
+                seq_parts=[]
+            else:
+                seq_parts.append(line.strip())
+        if pid: seqs[pid] = "".join(seq_parts)
+    print(f"[io] Read {len(seqs)} sequences from {path}")
+    return seqs
+
 
 
 def pad_terms_with_neighbors(terms, go_graph, go_embeds, max_terms=256):
@@ -97,8 +133,7 @@ def prepare_data(data_paths, max_terms=256, aspect=None):
     
     knn_terms_df = data_paths['knn_terms_df']
     train_terms_df = data_paths['train_terms_df']
-    features_embeds_path = data_paths['features_embeds_path']
-    features_ids_path = data_paths['features_ids_path']
+    train_sequences_path = data_paths['train_sequences_path']
 
     go_embeds_paths = data_paths['go_embeds_paths']
 
@@ -127,10 +162,8 @@ def prepare_data(data_paths, max_terms=256, aspect=None):
         seq_2_terms = seq_2_terms[seq_2_terms['terms_true'].apply(len) > 0]
 
 
-    features_embeds = np.load(features_embeds_path, allow_pickle=True)
-    features_ids = np.load(features_ids_path, allow_pickle=True)
-
-    features_embeds_dict = {feat_id: embed for feat_id, embed in zip(features_ids, features_embeds)}
+    # Load sequences from FASTA file
+    sequences = read_fasta(train_sequences_path)
 
     # Pad terms_predicted in the dataframe with GO graph neighbors
     seq_2_terms = pad_dataframe_terms(seq_2_terms, go_graph, embeddings_dict, max_terms=max_terms)
@@ -141,14 +174,16 @@ def prepare_data(data_paths, max_terms=256, aspect=None):
     #currently only using sequences with 256 terms, need to change later 
     seq_2_terms = seq_2_terms[term_lengths == max_terms]
 
-    train_ids =  pd.DataFrame(features_ids, columns=['qseqid'])
-    seq_2_terms = seq_2_terms.merge(train_ids, on='qseqid', how='inner')    
+    # Filter to keep only sequences that we have in the FASTA file
+    available_ids = set(sequences.keys())
+    seq_2_terms = seq_2_terms[seq_2_terms['qseqid'].isin(available_ids)]
 
     out = {'seq_2_terms': seq_2_terms,
            'train_terms': train_terms,
-           'features_embeds': features_embeds_dict,
+           'sequences': sequences,
            'go_embeds': embeddings_dict,
-           'go_graph': go_graph
+           'go_graph': go_graph,
+           'top_terms': list(embeddings_dict.keys())[:max_terms]
            }
     return out
     

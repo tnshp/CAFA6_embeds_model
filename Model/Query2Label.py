@@ -75,6 +75,8 @@ class Query2Label(nn.Module):
 
     def __init__(
         self,
+        feature_encoder,
+        feature_encoder_output_dim: int,
         num_classes: int,
         in_dim: int,
         nheads: int = 8,
@@ -87,6 +89,7 @@ class Query2Label(nn.Module):
         super().__init__()
 
         self.num_classes = num_classes
+        self.feature_encoder = feature_encoder
         hidden_dim = in_dim
         self.hidden_dim = hidden_dim
         
@@ -118,6 +121,7 @@ class Query2Label(nn.Module):
             decoder_layer, num_layers=num_decoder_layers
         )
 
+        self.projection = nn.Linear(feature_encoder_output_dim, hidden_dim)
         # Classification head: individual linear layer for each class
         self.classifier = MultiClassLinear(num_classes, hidden_dim)
 
@@ -131,7 +135,7 @@ class Query2Label(nn.Module):
     def forward(
         self,
         query: torch.Tensor, 
-        backbone_features: torch.Tensor, 
+        enc_input: torch.Tensor, 
         src_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
@@ -142,15 +146,16 @@ class Query2Label(nn.Module):
         Returns:
             logits: (B, num_classes)  (use BCEWithLogitsLoss)
         """
-        B, L, _ = backbone_features.shape
+        enc_output = self.feature_encoder(**enc_input)
+       
 
         # project to hidden_dim
-        src = backbone_features
-
-        # add positional encoding
-        if self.pos_encoder is not None:
-            src = self.pos_encoder(src)  # (B, L, D)
-
+        src = enc_output.last_hidden_state[:, 1:-1]  # (B, L, C_in)
+        B, L, _ = src.shape
+        src = self.projection(src)  # (B, L, D)
+    
+        src_key_padding_mask = enc_input['attention_mask'][:, 1:-1] == 0
+        
         # encode features
         memory = self.encoder(
             src, src_key_padding_mask=src_key_padding_mask

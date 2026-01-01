@@ -11,6 +11,8 @@ import math
 class Query2Label_pl(pl.LightningModule):
     def __init__(
         self,
+        feature_encoder,
+        feature_encoder_output_dim: int,
         num_classes: int,
         in_dim: int,
         nheads: int = 8,
@@ -33,9 +35,11 @@ class Query2Label_pl(pl.LightningModule):
         top_k_predictions: int = None,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['feature_encoder'])
 
         self.model = Query2Label(
+            feature_encoder=feature_encoder,
+            feature_encoder_output_dim=feature_encoder_output_dim,
             num_classes=num_classes,
             in_dim=in_dim,
             nheads=nheads,
@@ -91,21 +95,22 @@ class Query2Label_pl(pl.LightningModule):
         # Store top-k parameter
         self.top_k_predictions = top_k_predictions
 
-    def forward(self, x: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
-        return self.model(x, f) 
+    def forward(self, query: torch.Tensor, enc_input: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        return self.model(query, enc_input, src_key_padding_mask) 
 
     def training_step(self, batch, batch_idx):
         """Standard training step.
 
-        Expects `batch` to be a dict with keys `'tokens'` and `'label'` where
-        - `tokens` is a float Tensor of shape (B, L, C_in)
+        Expects `batch` to be a dict with keys `'go_embed'`, `'enc_input'` and `'label'` where
+        - `go_embed` is a float Tensor of shape (B, num_classes, C_in) - GO embeddings as queries
+        - `enc_input` is a dict with tokenized sequences
         - `label` is a binary Tensor of shape (B, num_classes)
         """
-        x = batch['go_embed']   # (B, L, C_in)
-        f = batch['feature']   
+        query = batch['go_embed']   # (B, num_classes, C_in)
+        enc_input = batch['enc_input']   
         y = batch['label']
 
-        logits = self.forward(x, f)
+        logits = self.forward(query, enc_input)
         
         # Calculate loss based on loss function type
         if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
@@ -132,11 +137,11 @@ class Query2Label_pl(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         """Validation step computes loss and stores for F-max computation."""
-        x = batch['go_embed']   # (B, L, C_in)
-        f = batch['feature']   
+        query = batch['go_embed']   # (B, num_classes, C_in)
+        enc_input = batch['enc_input']   
         y = batch['label']
 
-        logits = self.forward(x, f)
+        logits = self.forward(query, enc_input)
         
         # Calculate loss based on loss function type
         if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
@@ -261,10 +266,11 @@ class Query2Label_pl(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         """Test step computes loss and logs it."""
-        x = batch['tokens']
+        query = batch['go_embed']
+        enc_input = batch['enc_input']
         y = batch['label'].float()
 
-        logits = self.forward(x)
+        logits = self.forward(query, enc_input)
         loss = self.criterion(logits, y)
 
         # Log per-step test loss
