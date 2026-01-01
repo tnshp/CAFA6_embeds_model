@@ -18,7 +18,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 
 from Dataset.Utils import prepare_data
 from Utils.tokenizer import EmbedTokenizer
-from Dataset.Resample import resample
+# from Dataset.Resample import resample
 from Dataset.EmbeddingsDataset import EmbeddingsDataset, collate_tokenize, PrefetchLoader
 from Model.Query2Label_pl import Query2Label_pl
 

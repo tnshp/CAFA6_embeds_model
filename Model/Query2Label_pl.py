@@ -29,6 +29,8 @@ class Query2Label_pl(pl.LightningModule):
         clip: float = 0.05,
         loss_eps: float = 1e-8,
         disable_torch_grad_focal_loss: bool = True,
+        # Top-k filtering for validation
+        top_k_predictions: int = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -86,6 +88,8 @@ class Query2Label_pl(pl.LightningModule):
         self._val_go_targets = {}      # {go_term_id: list of binary labels}
         self._rank_score_list = []
         self._cutoff_score_list = []
+        # Store top-k parameter
+        self.top_k_predictions = top_k_predictions
 
     def forward(self, x: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
         return self.model(x, f) 
@@ -183,13 +187,29 @@ class Query2Label_pl(pl.LightningModule):
                 sample_probs = probs_np[sample_idx]  # Shape: (num_terms_for_sample,)
                 sample_targets = targets_np[sample_idx]  # Shape: (num_terms_for_sample,)
                 
+                # Apply top-k filtering if specified
+                if self.top_k_predictions is not None and self.top_k_predictions > 0:
+                    # Get indices sorted by prediction score (descending)
+                    sorted_indices = np.argsort(sample_probs)[::-1]
+                    
+                    # Create mask for top-k predictions
+                    top_k_mask = np.zeros(len(sample_probs), dtype=bool)
+                    k = min(self.top_k_predictions, len(sample_probs))
+                    top_k_mask[sorted_indices[:k]] = True
+                    
+                    # Zero out predictions not in top-k
+                    filtered_probs = sample_probs.copy()
+                    filtered_probs[~top_k_mask] = 0.0
+                else:
+                    filtered_probs = sample_probs
+                
                 # For each GO term in this sample
                 for term_idx, go_term in enumerate(sample_terms):
                     if go_term not in self._val_go_predictions:
                         self._val_go_predictions[go_term] = []
                         self._val_go_targets[go_term] = []
                     
-                    self._val_go_predictions[go_term].append(float(sample_probs[term_idx]))
+                    self._val_go_predictions[go_term].append(float(filtered_probs[term_idx]))
                     self._val_go_targets[go_term].append(int(sample_targets[term_idx]))
         except Exception as e:
             print(f"Warning: Could not store GO term predictions: {e}")
