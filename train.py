@@ -99,6 +99,17 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         except Exception:
             pass
 
+        # Freeze or unfreeze tokenizer parameters based on config
+        freeze_tokenizer = training_configs.get('freeze_tokenizer', True)
+        if freeze_tokenizer:
+            print("Freezing tokenizer parameters...")
+            for param in tokenizer.parameters():
+                param.requires_grad = False
+        else:
+            print("Tokenizer parameters will be trained...")
+            for param in tokenizer.parameters():
+                param.requires_grad = True
+
         # datasets: training uses all unique sampled indices (with repetitions), val uses remaining indices
         train_dataset = EmbeddingsDataset(data, oversample_indices=sampled_idx)
         val_dataset   = EmbeddingsDataset(data, oversample_indices=list(val_idx))

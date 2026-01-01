@@ -108,8 +108,8 @@ class EmbedTokenizer(nn.Module):
 
         P_np = np.stack(P_list, axis=0).astype(np.float32)  # (N, d, D)
         P_tensor = torch.from_numpy(P_np)
-        # register as buffer so it's not a parameter but moves with the module
-        self.register_buffer('P_buffer', P_tensor)
+        # register as parameter so it can be trained if needed
+        self.P_buffer = nn.Parameter(P_tensor, requires_grad=True)
 
     def forward(self, x):
 
@@ -130,8 +130,8 @@ class EmbedTokenizer(nn.Module):
             x = x.unsqueeze(0)
             squeeze_output = True
 
-        # Get P and move to correct device/dtype
-        P = self.P_buffer.to(dtype=x.dtype, device=x.device)  # (N, d, D)
+        # Get P and move to correct dtype
+        P = self.P_buffer.to(dtype=x.dtype)  # (N, d, D)
 
         # Vectorized matmul: (batch_size, D) @ (D, N*d) -> (batch_size, N*d) -> reshape
         D = x.shape[1]
