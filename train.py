@@ -219,13 +219,17 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
 
         # Gradient accumulation
         accumulate_grad_batches = int(training_configs.get('accumulate_grad_batches', 1))
+        
+        # Precision setting (bf16, fp16, or 32)
+        precision = training_configs.get('precision', 'bf16-mixed')
 
         trainer = pl.Trainer(max_epochs=max_epochs,
                              accelerator='auto',
                              devices=training_configs.get('devices', None),
                              logger=logger,
                              callbacks=[checkpoint_cb, lr_monitor, early_stop],
-                             accumulate_grad_batches=accumulate_grad_batches)
+                             accumulate_grad_batches=accumulate_grad_batches,
+                             precision=precision)
 
         # train (with optional resume from checkpoint)
         if resume_from_checkpoint is None:

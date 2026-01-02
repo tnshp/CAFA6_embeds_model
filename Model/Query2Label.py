@@ -92,6 +92,7 @@ class Query2Label(nn.Module):
         self.feature_encoder = feature_encoder
         hidden_dim = in_dim
         self.hidden_dim = hidden_dim
+        self.num_encoder_layers = num_encoder_layers
         
         self.pos_encoder = (
             PositionalEncoding(hidden_dim, dropout=dropout)
@@ -99,16 +100,20 @@ class Query2Label(nn.Module):
             else None
         )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=nheads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,  # (B, L, D)
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_encoder_layers
-        )
+        # Only create encoder if num_encoder_layers > 0
+        if num_encoder_layers > 0:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=nheads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,  # (B, L, D)
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer, num_layers=num_encoder_layers
+            )
+        else:
+            self.encoder = None
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
@@ -156,10 +161,13 @@ class Query2Label(nn.Module):
     
         src_key_padding_mask = enc_input['attention_mask'][:, 1:-1] == 0
         
-        # encode features
-        memory = self.encoder(
-            src, src_key_padding_mask=src_key_padding_mask
-        )  # (B, L, D)
+        # encode features (skip if num_encoder_layers is 0)
+        if self.encoder is not None:
+            memory = self.encoder(
+                src, src_key_padding_mask=src_key_padding_mask
+            )  # (B, L, D)
+        else:
+            memory = src  # No encoding, use projected features directly
 
         # no causal mask; all labels decoded in parallel
         tgt = query  # (B, num_classes, D)
