@@ -4,19 +4,31 @@ import numpy as np
 
 
 class EmbeddingsDataset(Dataset):
-    """Dataset that yields raw embeddings; tokenization is done in collate_fn for batching."""
+    """Dataset that tokenizes sequences and caches GO embeddings as tensors."""
     def __init__(self, 
                  data, 
+                 tokenizer=None,
+                 max_sequence_length=1024,
                  max_go_embeds = 256,  
                  oversample_indices=None
                 ):
         
         self.data = data
+        self.tokenizer = tokenizer
+        self.max_sequence_length = max_sequence_length
         self.max_go_embeds = max_go_embeds
         self.oversample_indices = oversample_indices if oversample_indices is not None else list(range(len(self.data['seq_2_terms'])))
-        self.mask_embed = np.zeros(next(iter(self.data['go_embeds'].values())).shape, dtype=np.float32)
-        #ensure len of predicted go terms is less than max_go_embeds
-        #self.data['seq_2_terms'] = self.data['seq_2_terms'][self
+        
+        # Pre-cache GO embeddings as tensors (significant speedup)
+        print("Pre-caching GO embeddings as tensors...")
+        self.go_embeds_tensor = {}
+        for term, embed in self.data['go_embeds'].items():
+            self.go_embeds_tensor[term] = torch.from_numpy(np.array(embed, dtype=np.float32))
+        
+        # Create a mask embedding tensor
+        mask_shape = next(iter(self.data['go_embeds'].values())).shape
+        self.mask_embed = torch.zeros(mask_shape, dtype=torch.float32)
+        print(f"Cached {len(self.go_embeds_tensor)} GO embeddings as tensors.")
 
 
     def __len__(self):
@@ -29,20 +41,32 @@ class EmbeddingsDataset(Dataset):
         qseqid = row['qseqid']
 
         sequence = self.data['sequences'][qseqid]
+        
+        # Tokenize sequence in worker (not in collate_fn)
+        if self.tokenizer is not None:
+            enc_input = self.tokenizer(
+                sequence, 
+                return_tensors="pt", 
+                padding=False,  # Will pad in collate_fn
+                truncation=True, 
+                max_length=self.max_sequence_length
+            )
+            # Remove batch dimension added by return_tensors="pt"
+            enc_input = {k: v.squeeze(0) for k, v in enc_input.items()}
+        else:
+            enc_input = None
 
         true_terms_set = set(row['terms_true'])
         predicted_terms = row['terms_predicted']
         
-        # Filter terms that have embeddings (should be all of them after padding)
-        # valid_terms = [term for term in predicted_terms if term in self.data['go_embeds']]
+        # Use pre-cached tensor GO embeddings (much faster)
         valid_terms = predicted_terms
-        # Vectorized operations using list comprehensions
-        go_embeds = np.array([self.data['go_embeds'].get(term, self.mask_embed) for term in valid_terms])
-        label = np.array([term in true_terms_set for term in valid_terms], dtype=np.float32)
+        go_embeds = torch.stack([self.go_embeds_tensor.get(term, self.mask_embed) for term in valid_terms])
+        label = torch.tensor([term in true_terms_set for term in valid_terms], dtype=torch.float32)
         
         return {
             'entryID'   : qseqid,
-            'sequence'   : sequence,
+            'enc_input' : enc_input,
             'go_embed'  : go_embeds,
             'label'     : label,
             'predicted_terms': valid_terms,
@@ -51,25 +75,36 @@ class EmbeddingsDataset(Dataset):
 
 
 
-def collate_tokenize(batch, tokenizer, device=None, dtype=torch.float32):
-    """Custom collate function to handle variable-length data.
+def collate_tokenize(batch, dtype=torch.float32):
+    """Custom collate function to handle variable-length tokenized data.
+    Tensors stay on CPU; device transfer handled by PrefetchLoader.
     
     Args:
-        batch: List of samples from the dataset
-        tokenizer: Tokenizer to apply to features
-        device: Device to move tensors to (cuda or cpu)
+        batch: List of samples from the dataset (already tokenized)
         dtype: Target dtype for tensors (torch.float32, torch.float16, or torch.bfloat16)
     """
-    sequences = [item['sequence'] for item in batch]
-    # sequences = sequences.to(dtype=dtype, device=device) if device else sequences.to(dtype=dtype)
-    enc_input = tokenizer(sequences, return_tensors="pt", padding=True, truncation=True, max_length=1024)
-    enc_input = {k: v.to(device) for k, v in enc_input.items()}
+    # Pad tokenized inputs to same length in batch
+    from torch.nn.utils.rnn import pad_sequence
     
-    go_embed = torch.stack([torch.from_numpy(item['go_embed']) for item in batch])
-    go_embed = go_embed.to(dtype=dtype, device=device) if device else go_embed.to(dtype=dtype)
+    # Extract and pad input_ids and attention_mask
+    input_ids = [item['enc_input']['input_ids'] for item in batch]
+    attention_mask = [item['enc_input']['attention_mask'] for item in batch]
     
-    label = torch.stack([torch.from_numpy(item['label']) for item in batch])
-    label = label.to(dtype=dtype, device=device) if device else label.to(dtype=dtype)
+    # Pad sequences (keep on CPU)
+    input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attention_mask_padded = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    
+    enc_input = {
+        'input_ids': input_ids_padded,
+        'attention_mask': attention_mask_padded
+    }
+    
+    # Stack GO embeddings and labels (already tensors, keep on CPU)
+    go_embed = torch.stack([item['go_embed'] for item in batch])
+    go_embed = go_embed.to(dtype=dtype)
+    
+    label = torch.stack([item['label'] for item in batch])
+    label = label.to(dtype=dtype)
     
     return {
         'entryID': [item['entryID'] for item in batch],
@@ -135,10 +170,19 @@ class PrefetchLoader:
             yield batch
     
     def _to_device(self, batch):
-        """Move batch to device (already moved in collate_fn, but ensure it's there)."""
+        """Move batch to device."""
         if isinstance(batch, dict):
-            # Batch is already on device from collate_fn, just return it
-            return batch
+            result = {}
+            for k, v in batch.items():
+                if k == 'enc_input' and isinstance(v, dict):
+                    # Handle nested dict for enc_input
+                    result[k] = {ek: ev.to(self.device, non_blocking=True) if isinstance(ev, torch.Tensor) else ev 
+                                 for ek, ev in v.items()}
+                elif isinstance(v, torch.Tensor):
+                    result[k] = v.to(self.device, non_blocking=True)
+                else:
+                    result[k] = v
+            return result
         return batch
     
     def __len__(self):

@@ -90,6 +90,8 @@ class Query2Label(nn.Module):
 
         self.num_classes = num_classes
         self.feature_encoder = feature_encoder
+        # Check if feature encoder is frozen
+        self.feature_encoder_frozen = not any(p.requires_grad for p in feature_encoder.parameters())
         hidden_dim = in_dim
         self.hidden_dim = hidden_dim
         self.num_encoder_layers = num_encoder_layers
@@ -109,9 +111,18 @@ class Query2Label(nn.Module):
                 dropout=dropout,
                 batch_first=True,  # (B, L, D)
             )
-            self.encoder = nn.TransformerEncoder(
-                encoder_layer, num_layers=num_encoder_layers
-            )
+            
+            # Create encoder with Flash Attention support
+            try:
+                self.encoder = nn.TransformerEncoder(
+                    encoder_layer, num_layers=num_encoder_layers,
+                    enable_nested_tensor=False  # Disable for Flash Attention compatibility
+                )
+            except TypeError:
+                # Fallback for older PyTorch versions without enable_nested_tensor
+                self.encoder = nn.TransformerEncoder(
+                    encoder_layer, num_layers=num_encoder_layers
+                )
         else:
             self.encoder = None
 
@@ -122,6 +133,8 @@ class Query2Label(nn.Module):
             dropout=dropout,
             batch_first=True,  # (B, T, D)
         )
+        
+        # Create decoder (enable_nested_tensor not supported in TransformerDecoder)
         self.decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=num_decoder_layers
         )
@@ -151,7 +164,12 @@ class Query2Label(nn.Module):
         Returns:
             logits: (B, num_classes)  (use BCEWithLogitsLoss)
         """
-        enc_output = self.feature_encoder(**enc_input)
+        # Use torch.no_grad() context if feature encoder is frozen
+        if self.feature_encoder_frozen:
+            with torch.no_grad():
+                enc_output = self.feature_encoder(**enc_input)
+        else:
+            enc_output = self.feature_encoder(**enc_input)
        
 
         # project to hidden_dim

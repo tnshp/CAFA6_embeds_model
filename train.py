@@ -95,7 +95,16 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         esm_model = AutoModel.from_pretrained(esm_model_name)
         
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Get precision setting for ESM model
+        precision = training_configs.get('precision', 'bf16-mixed')
+        use_bf16 = 'bf16' in precision
+        
+        # Move ESM to device and optionally convert to bfloat16
         esm_model = esm_model.to(device)
+        if use_bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            print("Converting ESM model to bfloat16...")
+            esm_model = esm_model.to(torch.bfloat16)
         
         # Get ESM model output dimension
         esm_output_dim = esm_model.config.hidden_size
@@ -104,7 +113,8 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         # Freeze or unfreeze ESM model parameters based on config
         freeze_feature_encoder = training_configs.get('freeze_feature_encoder', True)
         if freeze_feature_encoder:
-            print("Freezing ESM model parameters...")
+            print("Freezing ESM model parameters and setting to eval mode...")
+            esm_model.eval()
             for param in esm_model.parameters():
                 param.requires_grad = False
         else:
@@ -113,22 +123,26 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
                 param.requires_grad = True
 
         # datasets: training uses all unique sampled indices (with repetitions), val uses remaining indices
-        train_dataset = EmbeddingsDataset(data, oversample_indices=sampled_idx)
-        val_dataset   = EmbeddingsDataset(data, oversample_indices=list(val_idx))
+        train_dataset = EmbeddingsDataset(data, tokenizer=esm_tokenizer, max_sequence_length=max_sequence_length, oversample_indices=sampled_idx)
+        val_dataset   = EmbeddingsDataset(data, tokenizer=esm_tokenizer, max_sequence_length=max_sequence_length, oversample_indices=list(val_idx))
 
         # dataloaders
         batch_size  = int(training_configs.get('batch_size', 32))
-        num_workers = int(training_configs.get('num_workers', 0))
+        num_workers = int(training_configs.get('num_workers', 4))  # Default to 4 for parallel loading
 
         # pin_memory=True for faster host-to-device transfer when num_workers > 0
-        # Tokenization happens in collate_fn using ESM tokenizer
+        # persistent_workers=True to avoid worker respawn overhead
         pin_memory = True if num_workers > 0 else False
+        persistent_workers = True if num_workers > 0 else False
+        
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                                  pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b, esm_tokenizer, device))
+                                  pin_memory=pin_memory, persistent_workers=persistent_workers,
+                                  collate_fn=collate_tokenize)
         train_loader = PrefetchLoader(train_loader, device)
 
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                                pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b, esm_tokenizer, device))
+                                pin_memory=pin_memory, persistent_workers=persistent_workers,
+                                collate_fn=collate_tokenize)
         val_loader = PrefetchLoader(val_loader, device)
 
         # instantiate model
@@ -155,6 +169,35 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
                                clip     =float(training_configs.get('clip', 0.05)),
                                loss_eps =float(training_configs.get('loss_eps', 1e-8)),
                                disable_torch_grad_focal_loss=bool(training_configs.get('disable_torch_grad_focal_loss', True)))
+
+        # Apply torch.compile() for PyTorch 2.x speedup
+        use_compile = training_configs.get('use_torch_compile', True)
+        if use_compile and hasattr(torch, 'compile'):
+            try:
+                print("Compiling model with torch.compile()...")
+                # Compile only the internal model, not the LightningModule wrapper
+                model.model = torch.compile(model.model, mode='default')
+                print("Model compilation successful.")
+            except Exception as e:
+                print(f"Warning: torch.compile() failed: {e}. Continuing without compilation.")
+
+        # Enable TF32 for faster matmul on Ampere+ GPUs
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            
+            # Enable Flash Attention (SDPA backend) for faster attention
+            # This automatically uses Flash Attention 2 when available
+            try:
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                torch.backends.cuda.enable_math_sdp(False)  # Disable slower fallback
+                print("Enabled Flash Attention (SDPA) backend for faster attention computation.")
+            except AttributeError:
+                print("Flash Attention not available in this PyTorch version. Using default attention.")
+            
+            print("Enabled TF32 and cudnn.benchmark for faster training.")
 
         # compute total steps for scheduler and set on model.hparams
         max_epochs = int(training_configs.get('max_epochs', 10))
