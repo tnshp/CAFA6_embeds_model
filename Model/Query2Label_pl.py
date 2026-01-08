@@ -31,9 +31,12 @@ class Query2Label_pl(pl.LightningModule):
         disable_torch_grad_focal_loss: bool = True,
         # Top-k filtering for validation
         top_k_predictions: int = None,
+        # IA (Information Accretion) weights for F1 computation
+        ia_dict: dict = None,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['ia_dict'])  # Don't save ia_dict in hparams
+        self.ia_dict = ia_dict  # Store separately
 
         self.model = Query2Label(
             num_classes=num_classes,
@@ -83,9 +86,8 @@ class Query2Label_pl(pl.LightningModule):
         self.validation_step_outputs = []
         # Test step outputs
         self.test_step_outputs = []
-        # For GO term-based F1 computation (store predictions per GO term)
-        self._val_go_predictions = {}  # {go_term_id: list of probabilities}
-        self._val_go_targets = {}      # {go_term_id: list of binary labels}
+        # For protein-based F1 computation (store predictions per protein)
+        self._val_protein_predictions = {}  # {protein_id: {'pred_terms': set, 'true_terms': set}}
         self._rank_score_list = []
         self._cutoff_score_list = []
         # Store top-k parameter
@@ -166,13 +168,15 @@ class Query2Label_pl(pl.LightningModule):
         # Store for epoch end aggregation
         self.validation_step_outputs.append({'val_loss': loss.detach()})
         
-        # Store GO term-specific predictions for macro/micro F1
+        # Store protein-specific predictions for macro F1
         probs = torch.sigmoid(logits)
         targets = (y > 0.5).int()
         try:
             probs_np = probs.detach().cpu().numpy()
             targets_np = targets.detach().cpu().numpy()
             predicted_terms = batch['predicted_terms']  # List of lists of GO term IDs
+            entry_ids = batch['entryID']  # List of protein IDs
+            true_terms = batch.get('true_terms', None)  # List of lists of true GO term IDs
             
             #Calculate rankscore and cutoff score
             rank_score = self._compute_rank_score(probs_np, targets_np, predicted_terms)
@@ -183,36 +187,39 @@ class Query2Label_pl(pl.LightningModule):
 
             # For each sample in the batch
             for sample_idx in range(len(predicted_terms)):
+                entry_id = entry_ids[sample_idx]
                 sample_terms = predicted_terms[sample_idx]
                 sample_probs = probs_np[sample_idx]  # Shape: (num_terms_for_sample,)
                 sample_targets = targets_np[sample_idx]  # Shape: (num_terms_for_sample,)
                 
-                # Apply top-k filtering if specified
+                # Get true terms for this sample
+                sample_true_terms = set(true_terms[sample_idx]) if true_terms is not None else set()
+                if not sample_true_terms:
+                    # Fallback: derive from targets
+                    sample_true_terms = set(term for i, term in enumerate(sample_terms) if sample_targets[i] > 0.5)
+                
+                # Apply top-k filtering if specified, otherwise use threshold
                 if self.top_k_predictions is not None and self.top_k_predictions > 0:
                     # Get indices sorted by prediction score (descending)
                     sorted_indices = np.argsort(sample_probs)[::-1]
-                    
-                    # Create mask for top-k predictions
-                    top_k_mask = np.zeros(len(sample_probs), dtype=bool)
                     k = min(self.top_k_predictions, len(sample_probs))
-                    top_k_mask[sorted_indices[:k]] = True
-                    
-                    # Zero out predictions not in top-k
-                    filtered_probs = sample_probs.copy()
-                    filtered_probs[~top_k_mask] = 0.0
+                    top_k_indices = sorted_indices[:k]
+                    sample_pred_terms = set(sample_terms[i] for i in top_k_indices)
                 else:
-                    filtered_probs = sample_probs
+                    # Use threshold (default 0.5)
+                    threshold = 0.5
+                    sample_pred_terms = set(term for i, term in enumerate(sample_terms) if sample_probs[i] >= threshold)
                 
-                # For each GO term in this sample
-                for term_idx, go_term in enumerate(sample_terms):
-                    if go_term not in self._val_go_predictions:
-                        self._val_go_predictions[go_term] = []
-                        self._val_go_targets[go_term] = []
-                    
-                    self._val_go_predictions[go_term].append(float(filtered_probs[term_idx]))
-                    self._val_go_targets[go_term].append(int(sample_targets[term_idx]))
+                # Store predictions and true terms for this protein
+                if entry_id not in self._val_protein_predictions:
+                    self._val_protein_predictions[entry_id] = {
+                        'pred_terms': sample_pred_terms,
+                        'true_terms': sample_true_terms
+                    }
         except Exception as e:
-            print(f"Warning: Could not store GO term predictions: {e}")
+            print(f"Warning: Could not store protein predictions: {e}")
+            import traceback
+            traceback.print_exc()
             pass
 
     def on_validation_epoch_end(self) -> None:
@@ -232,28 +239,31 @@ class Query2Label_pl(pl.LightningModule):
         self.log('val_cutoff_score', mean_cutoff_score, prog_bar=True, logger=True)
 
 
-        # Compute GO term-based macro and micro F1 scores
+        # Compute protein-based macro F1 scores
         try:
-            if len(self._val_go_predictions) > 0:
-                macro_f1, micro_f1 = self._compute_go_f1_scores()
+            if len(self._val_protein_predictions) > 0:
+                macro_f1, macro_precision, macro_recall = self._compute_protein_f1_scores()
                 self.log('val_f1_macro_go', macro_f1, prog_bar=True, logger=True)
-                self.log('val_f1_micro_go', micro_f1, prog_bar=True, logger=True)
+                self.log('val_precision_macro', macro_precision, prog_bar=True, logger=True)
+                self.log('val_recall_macro', macro_recall, prog_bar=True, logger=True)
                 
                 try:
                     rank = getattr(self, 'global_rank', 0)
                 except Exception:
                     rank = 0
                 if rank == 0:
-                    print(f"Validation GO-based Macro F1: {macro_f1:.4f}, Micro F1: {micro_f1:.4f}, Rank Score: {mean_rank_score:.4f}, Cutoff Score: {mean_cutoff_score:.4f}")
+                    weighting_str = "IA-weighted" if self.ia_dict is not None else "Unweighted"
+                    print(f"Validation Protein-based Macro ({weighting_str}) - Precision: {macro_precision:.4f}, Recall: {macro_recall:.4f}, F1: {macro_f1:.4f}, Rank Score: {mean_rank_score:.4f}, Cutoff Score: {mean_cutoff_score:.4f}")
                 
-                # Clear GO term buffers
-                self._val_go_predictions.clear()
-                self._val_go_targets.clear()
+                # Clear protein prediction buffers
+                self._val_protein_predictions.clear()
                 self._rank_score_list.clear()
                 self._cutoff_score_list.clear()
                 
         except Exception as e:
-            print(f"Warning: Could not compute GO-based F1 scores: {e}")
+            print(f"Warning: Could not compute protein-based F1 scores: {e}")
+            import traceback
+            traceback.print_exc()
             pass
         
         # Clear stored outputs for next epoch
@@ -360,59 +370,54 @@ class Query2Label_pl(pl.LightningModule):
         return float(np.mean(batch_scores)) if batch_scores else 0.0
 
 
-    def _compute_go_f1_scores(self, threshold=0.5):
-        """Compute macro and micro F1 scores based on GO term predictions.
+    def _compute_protein_f1_scores(self):
+        """Compute macro F1 scores based on per-protein predictions.
         
-        For each GO term, we have multiple predictions across different samples.
-        Macro F1: Average F1 score across all GO terms
-        Micro F1: F1 score computed from global TP, FP, FN counts
+        For each protein, compute precision, recall, and F1 by comparing
+        predicted terms vs true terms. Then macro-average across all proteins.
+        
+        Uses IA (Information Accretion) weighting if ia_dict is provided.
+        This matches the notebook implementation in test_model.ipynb.
         """
         eps = 1e-8
-        per_term_f1_scores = []
+        per_protein_precisions = []
+        per_protein_recalls = []
+        per_protein_f1_scores = []
         
-        # Global counts for micro F1
-        global_tp = 0
-        global_fp = 0
-        global_fn = 0
+        use_ia_weighting = self.ia_dict is not None
         
-        # Compute F1 for each GO term
-        for go_term, predictions in self._val_go_predictions.items():
-            targets = self._val_go_targets[go_term]
+        # Compute metrics for each protein
+        for protein_id, protein_data in self._val_protein_predictions.items():
+            pred_terms = protein_data['pred_terms']
+            true_terms = protein_data['true_terms']
             
-            # Convert to numpy for easier computation
-            preds_array = np.array(predictions)
-            targets_array = np.array(targets)
+            # Compute TP, FP, FN for this protein
+            if use_ia_weighting:
+                # Weighted by IA scores
+                tp = sum(self.ia_dict.get(term, 0.0) for term in (pred_terms & true_terms))
+                fp = sum(self.ia_dict.get(term, 0.0) for term in (pred_terms - true_terms))
+                fn = sum(self.ia_dict.get(term, 0.0) for term in (true_terms - pred_terms))
+            else:
+                # Unweighted (count)
+                tp = len(pred_terms & true_terms)  # Intersection
+                fp = len(pred_terms - true_terms)  # Predicted but not true
+                fn = len(true_terms - pred_terms)  # True but not predicted
             
-            # Binarize predictions
-            preds_binary = (preds_array >= threshold).astype(int)
+            # Compute precision, recall, F1 for this protein
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall + eps) if (precision + recall) > 0 else 0.0
             
-            # Compute TP, FP, FN for this GO term
-            tp = np.sum((preds_binary == 1) & (targets_array == 1))
-            fp = np.sum((preds_binary == 1) & (targets_array == 0))
-            fn = np.sum((preds_binary == 0) & (targets_array == 1))
-            
-            # Accumulate for micro F1
-            global_tp += tp
-            global_fp += fp
-            global_fn += fn
-            
-            # Compute F1 for this term
-            precision = tp / (tp + fp + eps)
-            recall = tp / (tp + fn + eps)
-            f1 = 2 * precision * recall / (precision + recall + eps)
-            
-            per_term_f1_scores.append(f1)
+            per_protein_precisions.append(precision)
+            per_protein_recalls.append(recall)
+            per_protein_f1_scores.append(f1)
         
-        # Compute macro F1 (average across all GO terms)
-        macro_f1 = float(np.mean(per_term_f1_scores)) if per_term_f1_scores else 0.0
+        # Macro-average: average across all proteins
+        macro_precision = float(np.mean(per_protein_precisions)) if per_protein_precisions else 0.0
+        macro_recall = float(np.mean(per_protein_recalls)) if per_protein_recalls else 0.0
+        macro_f1 = float(np.mean(per_protein_f1_scores)) if per_protein_f1_scores else 0.0
         
-        # Compute micro F1 (global counts)
-        micro_precision = global_tp / (global_tp + global_fp + eps)
-        micro_recall = global_tp / (global_tp + global_fn + eps)
-        micro_f1 = 2 * micro_precision * micro_recall / (micro_precision + micro_recall + eps)
-        micro_f1 = float(micro_f1)
-        
-        return macro_f1, micro_f1
+        return macro_f1, macro_precision, macro_recall
         
 
     def configure_optimizers(self):

@@ -46,45 +46,90 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         print(f"Preparing data with aspect {training_configs.get('aspect', None)} max terms {model_configs.get('max_terms', None)}...")
         data = prepare_data(configs.get('data_paths', {}), max_terms = model_configs.get('max_terms', None), aspect=training_configs.get('aspect', None))
         print("Data preparation complete.")
+        
+        # Load IA (Information Accretion) scores for weighted F1 computation
+        ia_dict = None
+        ia_file_path = configs.get('data_paths', {}).get('ia_file_path', None)
+        if ia_file_path and os.path.exists(ia_file_path):
+            print(f"Loading IA scores from {ia_file_path}...")
+            ia_df = pd.read_csv(ia_file_path, sep='\t', header=None)
+            ia_df.columns = ['terms', 'ia']
+            ia_dict = dict(zip(ia_df['terms'], ia_df['ia']))
+            print(f"Loaded IA scores for {len(ia_dict)} GO terms")
+        else:
+            print("No IA file specified or file not found, using unweighted F1")
 
         
-        # Determine sampling / splitting behavior
-        sampling_instances = training_configs.get('sampling_instances', None)
-        val_fraction = float(training_configs.get('val_fraction', 0.3))
-        seed = training_configs.get('seed', None)
-
+        # Load predefined train/val split from mmseq clustering
+        train_ids_path = configs.get('data_paths', {}).get('train_ids_path', None)
+        val_ids_path = configs.get('data_paths', {}).get('val_ids_path', None)
+        
         all_idx = np.arange(len(data['seq_2_terms']))
-
-        if sampling_instances is not None:
-            # resample / oversample indices for training (may include repetitions)
-            sampled_idx = resample(data, train_terms_df, strategy=training_configs.get('sampling_strategy', ''), I=sampling_instances)
-            if not sampled_idx:
-                print("Warning: resample returned no indices (empty). Falling back to using all available indices for training.")
-                sampled_idx = list(range(len(data['seq_2_terms'])))
-
-            print(f"Resampled {len(sampled_idx)} indices for training (with repetitions).")
-
-            # use all UNIQUE indices in sampled_idx for training (class-balanced)
-            unique_train_idx = np.unique(sampled_idx)
-            print(f"Unique training indices: {len(unique_train_idx)}")
-
-            # split remaining indices for validation (no test set)
-            remaining_idx = np.setdiff1d(all_idx, unique_train_idx)
-            val_idx = remaining_idx.tolist()
-            print(f"Val indices: {len(val_idx)} (using all remaining indices), Test set removed")
-        else:
-            # No sampling_instances provided: split indices randomly into train/val according to val_fraction
-            rng = np.random.RandomState(seed) if seed is not None else np.random
-            perm = rng.permutation(all_idx)
-            n_val = int(np.round(len(all_idx) * val_fraction))
-            val_idx = perm[:n_val].tolist()
-            train_idx = perm[n_val:].tolist()
-
-            # For consistency with downstream code, set sampled_idx to train indices (no repetitions)
+        
+        if train_ids_path and val_ids_path:
+            # Use predefined split from mmseq clustering
+            print(f"Loading predefined train/val split from:")
+            print(f"  Train IDs: {train_ids_path}")
+            print(f"  Val IDs: {val_ids_path}")
+            
+            # Load train and val IDs
+            train_seq_ids = pd.read_csv(train_ids_path, header=None)
+            val_seq_ids = pd.read_csv(val_ids_path, header=None)
+            
+            # Extract the middle part of the ID (between | |)
+            train_ids_set = set(train_seq_ids[0].str.split('|').str[1].tolist())
+            val_ids_set = set(val_seq_ids[0].str.split('|').str[1].tolist())
+            
+            print(f"Loaded {len(train_ids_set)} train IDs and {len(val_ids_set)} val IDs")
+            
+            # Map sequence IDs to indices in data['seq_2_terms']
+            seq_ids = data['seq_2_terms']['qseqid'].values
+            train_idx = [i for i, seq_id in enumerate(seq_ids) if seq_id in train_ids_set]
+            val_idx = [i for i, seq_id in enumerate(seq_ids) if seq_id in val_ids_set]
+            
+            print(f"Mapped to {len(train_idx)} train indices and {len(val_idx)} val indices")
+            
+            # For consistency with downstream code
             sampled_idx = list(train_idx)
             unique_train_idx = np.array(train_idx)
+            
+        else:
+            # Fallback to original random split behavior
+            print("No predefined split found, using random split...")
+            sampling_instances = training_configs.get('sampling_instances', None)
+            val_fraction = float(training_configs.get('val_fraction', 0.3))
+            seed = training_configs.get('seed', None)
 
-            print(f"No sampling_instances set: randomly split {len(all_idx)} indices into {len(train_idx)} train and {len(val_idx)} val (val_fraction={val_fraction}).")
+            if sampling_instances is not None:
+                # resample / oversample indices for training (may include repetitions)
+                sampled_idx = resample(data, train_terms_df, strategy=training_configs.get('sampling_strategy', ''), I=sampling_instances)
+                if not sampled_idx:
+                    print("Warning: resample returned no indices (empty). Falling back to using all available indices for training.")
+                    sampled_idx = list(range(len(data['seq_2_terms'])))
+
+                print(f"Resampled {len(sampled_idx)} indices for training (with repetitions).")
+
+                # use all UNIQUE indices in sampled_idx for training (class-balanced)
+                unique_train_idx = np.unique(sampled_idx)
+                print(f"Unique training indices: {len(unique_train_idx)}")
+
+                # split remaining indices for validation (no test set)
+                remaining_idx = np.setdiff1d(all_idx, unique_train_idx)
+                val_idx = remaining_idx.tolist()
+                print(f"Val indices: {len(val_idx)} (using all remaining indices), Test set removed")
+            else:
+                # No sampling_instances provided: split indices randomly into train/val according to val_fraction
+                rng = np.random.RandomState(seed) if seed is not None else np.random
+                perm = rng.permutation(all_idx)
+                n_val = int(np.round(len(all_idx) * val_fraction))
+                val_idx = perm[:n_val].tolist()
+                train_idx = perm[n_val:].tolist()
+
+                # For consistency with downstream code, set sampled_idx to train indices (no repetitions)
+                sampled_idx = list(train_idx)
+                unique_train_idx = np.array(train_idx)
+
+                print(f"No sampling_instances set: randomly split {len(all_idx)} indices into {len(train_idx)} train and {len(val_idx)} val (val_fraction={val_fraction}).")
 
         # build tokenizer
         key = next(iter(data['features_embeds']))
@@ -149,7 +194,9 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
                                gamma_pos=float(training_configs.get('gamma_pos', 0.0)),
                                clip     =float(training_configs.get('clip', 0.05)),
                                loss_eps =float(training_configs.get('loss_eps', 1e-8)),
-                               disable_torch_grad_focal_loss=bool(training_configs.get('disable_torch_grad_focal_loss', True)))
+                               disable_torch_grad_focal_loss=bool(training_configs.get('disable_torch_grad_focal_loss', True)),
+                               # IA weighting for F1 computation
+                               ia_dict=ia_dict)
 
         # compute total steps for scheduler and set on model.hparams
         max_epochs = int(training_configs.get('max_epochs', 10))

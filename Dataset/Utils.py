@@ -2,6 +2,28 @@ import numpy as np
 import pandas as pd
 import pickle
 import obonet
+from typing import Dict, List
+
+
+def read_fasta(path: str) -> Dict[str, str]:
+    seqs = {}
+    with open(path, "r") as f:
+        pid = None; seq_parts = []
+        for line in f:
+            line=line.strip()
+            if line.startswith(">"):
+                if pid: seqs[pid] = "".join(seq_parts)
+                header=line[1:].split()[0]
+                if "|" in header:
+                    parts=header.split("|"); pid = parts[1] if len(parts)>=2 else header
+                else:
+                    pid = header
+                seq_parts=[]
+            else:
+                seq_parts.append(line.strip())
+        if pid: seqs[pid] = "".join(seq_parts)
+    print(f"[io] Read {len(seqs)} sequences from {path}")
+    return seqs
 
 
 def pad_terms_with_neighbors(terms, go_graph, go_embeds, max_terms=256):
