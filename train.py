@@ -16,7 +16,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from Dataset.Utils import prepare_data
+from Dataset.Utils import load_data
 from Utils.tokenizer import EmbedTokenizer
 # from Dataset.Resample import resample
 from Dataset.EmbeddingsDataset import EmbeddingsDataset, collate_tokenize, PrefetchLoader
@@ -44,7 +44,7 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         training_configs = configs.get('training_configs', {})
 
         print(f"Preparing data with aspect {training_configs.get('aspect', None)} max terms {model_configs.get('max_terms', None)}...")
-        data = prepare_data(configs.get('data_paths', {}), max_terms = model_configs.get('max_terms', None), aspect=training_configs.get('aspect', None))
+        data = load_data(configs.get('data_paths', {}), max_terms = model_configs.get('max_terms', None), aspect=training_configs.get('aspect', None))
         print("Data preparation complete.")
         
         # Load IA (Information Accretion) scores for weighted F1 computation

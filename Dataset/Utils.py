@@ -3,6 +3,8 @@ import pandas as pd
 import pickle
 import obonet
 from typing import Dict, List
+from tqdm.auto import tqdm
+
 
 
 def read_fasta(path: str) -> Dict[str, str]:
@@ -173,4 +175,137 @@ def prepare_data(data_paths, max_terms=256, aspect=None):
            'go_graph': go_graph
            }
     return out
+
+def pad_with_random_terms(terms, max_terms, all_terms_array, existing_terms_set=None):
+    """Optimized padding with random GO terms using rejection sampling."""
+    if len(terms) >= max_terms:
+        return terms[:max_terms]
     
+    # Calculate how many more terms we need
+    num_needed = max_terms - len(terms)
+    
+    # Use pre-computed set if available, otherwise create it
+    if existing_terms_set is None:
+        existing_terms_set = set(terms)
+    
+    # For small num_needed relative to available terms, use rejection sampling
+    # This avoids creating the full boolean mask
+    if num_needed < len(all_terms_array) * 0.1:  # If we need < 10% of total terms
+        random_terms = []
+        max_attempts = num_needed * 10  # Prevent infinite loop
+        attempts = 0
+        
+        while len(random_terms) < num_needed and attempts < max_attempts:
+            # Sample with replacement first (fast)
+            batch_size = min(num_needed * 2, 1000)  # Sample in batches
+            candidates = np.random.choice(all_terms_array, size=batch_size, replace=True)
+            
+            # Filter out existing terms
+            for candidate in candidates:
+                if candidate not in existing_terms_set:
+                    random_terms.append(candidate)
+                    existing_terms_set.add(candidate)
+                    if len(random_terms) >= num_needed:
+                        break
+            
+            attempts += batch_size
+        
+        # If rejection sampling didn't get enough, fall back to full filtering
+        if len(random_terms) < num_needed:
+            available_mask = np.isin(all_terms_array, list(existing_terms_set), invert=True)
+            available_terms = all_terms_array[available_mask]
+            remaining_needed = num_needed - len(random_terms)
+            
+            if len(available_terms) >= remaining_needed:
+                additional = np.random.choice(available_terms, size=remaining_needed, replace=False).tolist()
+            else:
+                additional = np.random.choice(available_terms, size=remaining_needed, replace=True).tolist()
+            
+            random_terms.extend(additional)
+    else:
+        # For large num_needed, use vectorized filtering (more efficient for bulk)
+        available_mask = np.isin(all_terms_array, list(existing_terms_set), invert=True)
+        available_terms = all_terms_array[available_mask]
+        
+        # Randomly sample
+        if len(available_terms) >= num_needed:
+            random_terms = np.random.choice(available_terms, size=num_needed, replace=False).tolist()
+        else:
+            # If not enough unique terms, sample with replacement
+            random_terms = np.random.choice(available_terms, size=num_needed, replace=True).tolist()
+    
+    return terms + random_terms[:num_needed]
+
+def load_data(data_paths, max_terms=256, aspect=None):
+    
+    seq_2_terms_df = data_paths['seq_2_terms_df']
+    train_terms_df = data_paths['train_terms_df']
+    features_embeds_path = data_paths['features_embeds_path']
+    features_ids_path = data_paths['features_ids_path']
+
+    go_embeds_paths = data_paths['go_embeds_paths']
+
+    seq_2_terms = pd.read_parquet(seq_2_terms_df, engine='fastparquet')
+    train_terms = pd.read_csv(train_terms_df, sep='\t')
+
+    print("loading features embeddings and ids")
+    features_embeds = np.load(features_embeds_path, allow_pickle=True)
+    features_ids = np.load(features_ids_path, allow_pickle=True)
+    
+    print("creating features embeddings dict")
+    
+    features_embeds_dict = {feat_id: embed for feat_id, embed in zip(features_ids, features_embeds)}
+
+
+    term_to_aspect = train_terms.groupby('term')['aspect'].first().to_dict()
+
+    with open(go_embeds_paths, 'rb') as f:
+        data = pickle.load(f)
+        embeddings_dict = data['embeddings']
+        go_ids = data['go_ids']
+
+    # Filter to keep only terms from a specific aspect if aspect is provided
+    print('filtering by aspect:', aspect)
+    if aspect is not None:
+        seq_2_terms['terms_predicted'] = seq_2_terms['terms_predicted'].apply(
+            lambda terms: [t for t in terms if term_to_aspect.get(t) == aspect]
+        )
+        seq_2_terms['terms_true'] = seq_2_terms['terms_true'].apply(
+            lambda terms: [t for t in terms if term_to_aspect.get(t) == aspect]
+        )
+        # Remove rows where terms_predicted or terms_true is now empty
+        seq_2_terms = seq_2_terms[seq_2_terms['terms_predicted'].apply(len) > 0]
+        seq_2_terms = seq_2_terms[seq_2_terms['terms_true'].apply(len) > 0]
+
+        # Pad terms with random terms from the same aspect
+        print(f"Padding terms_predicted with random terms from aspect {aspect}...")
+        # Get all terms from this aspect that have embeddings
+        aspect_terms = [term for term, asp in term_to_aspect.items() if asp == aspect and term in embeddings_dict]
+        all_aspect_terms = np.array(aspect_terms)
+        
+        tqdm.pandas(desc=f"Padding with random {aspect} terms")
+        seq_2_terms['terms_predicted'] = seq_2_terms['terms_predicted'].progress_apply(
+            lambda terms: pad_with_random_terms(terms, max_terms, all_aspect_terms)
+        )
+        
+        # Verify padding
+        term_lengths_after = seq_2_terms['terms_predicted'].apply(len)
+        print(f"After padding - Min: {term_lengths_after.min()}, Max: {term_lengths_after.max()}, Mean: {term_lengths_after.mean():.2f}")
+
+    
+    
+
+    print("filtering sequences by term lengths")
+   #currently only using sequences with 256 terms, need to change later 
+    # seq_2_terms = seq_2_terms[term_lengths == max_terms]
+
+    train_ids =  pd.DataFrame(features_ids, columns=['qseqid'])
+    seq_2_terms = seq_2_terms.merge(train_ids, on='qseqid', how='inner')    
+
+    out = {'seq_2_terms': seq_2_terms,
+           'train_terms': train_terms,
+           'features_embeds': features_embeds_dict,
+           'go_embeds': embeddings_dict,
+           }
+    
+    return out
