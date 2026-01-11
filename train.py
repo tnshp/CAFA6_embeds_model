@@ -188,7 +188,7 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
                                lr                =training_configs.get('lr', 1e-4),
                                weight_decay      =training_configs.get('weight_decay', 1e-5),
                                # loss selection
-                               loss_function=training_configs.get('loss_function', 'ASL'),
+                               loss_function=training_configs.get('loss_function', 'BCE'),
                                # pass asymmetric loss params from configs
                                gamma_neg=float(training_configs.get('gamma_neg', 4.0)),
                                gamma_pos=float(training_configs.get('gamma_pos', 0.0)),
