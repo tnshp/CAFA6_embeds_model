@@ -18,7 +18,6 @@ class Query2Label_pl(pl.LightningModule):
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
-        use_positional_encoding: bool = True,
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         # Loss selection: 'ASL' or 'BCE'
@@ -45,8 +44,7 @@ class Query2Label_pl(pl.LightningModule):
             num_encoder_layers=num_encoder_layers,
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            use_positional_encoding=use_positional_encoding,
+            dropout=dropout
         )
 
     
@@ -93,8 +91,11 @@ class Query2Label_pl(pl.LightningModule):
         # Store top-k parameter
         self.top_k_predictions = top_k_predictions
 
-    def forward(self, x: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
-        return self.model(x, f) 
+    def forward(self, x: torch.Tensor, f: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        # Invert mask: PyTorch expects True for positions to IGNORE, we have True for VALID positions
+        if mask is not None:
+            mask = ~mask
+        return self.model(x, f, src_key_padding_mask=mask) 
 
     def training_step(self, batch, batch_idx):
         """Standard training step.
@@ -104,10 +105,11 @@ class Query2Label_pl(pl.LightningModule):
         - `label` is a binary Tensor of shape (B, num_classes)
         """
         x = batch['go_embed']   # (B, L, C_in)
-        f = batch['feature']   
+        f = batch['features']   
         y = batch['label']
+        mask = batch.get('mask', None)  # (B, L) attention mask
 
-        logits = self.forward(x, f)
+        logits = self.forward(x, f, mask)
         
         # Calculate loss based on loss function type
         if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
@@ -135,10 +137,11 @@ class Query2Label_pl(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         """Validation step computes loss and stores for F-max computation."""
         x = batch['go_embed']   # (B, L, C_in)
-        f = batch['feature']   
+        f = batch['features']   
         y = batch['label']
+        mask = batch.get('mask', None)  # (B, L) attention mask
 
-        logits = self.forward(x, f)
+        logits = self.forward(x, f, mask)
         
         # Calculate loss based on loss function type
         if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):

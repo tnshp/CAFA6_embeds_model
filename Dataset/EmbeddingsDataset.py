@@ -3,7 +3,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
 class EmbeddingsDataset(Dataset):
-    """Dataset that yields raw embeddings; tokenization is done in collate_fn for batching."""
+    """Dataset that yields raw PLM and BLM embeddings; tokenization and projection done in collate_fn."""
     def __init__(self, 
                  data, 
                  max_go_embeds = 256,  
@@ -14,9 +14,12 @@ class EmbeddingsDataset(Dataset):
         self.max_go_embeds = max_go_embeds
         self.oversample_indices = oversample_indices if oversample_indices is not None else list(range(len(self.data['seq_2_terms'])))
         self.mask_embed = np.zeros(next(iter(self.data['go_embeds'].values())).shape, dtype=np.float32)
-        #ensure len of predicted go terms is less than max_go_embeds
-        #self.data['seq_2_terms'] = self.data['seq_2_terms'][self
-
+        
+        # Get dimensions for PLM and BLM embeddings
+        self.plm_dim = self.data['plm_embeds'][next(iter(self.data['plm_embeds']))].shape[0]
+        self.blm_dim = self.data['pmid_2_embed'][next(iter(self.data['pmid_2_embed']))].shape[0]
+        
+        print(f"PLM dim: {self.plm_dim}, BLM dim: {self.blm_dim}")
 
     def __len__(self):
         return len(self.oversample_indices)         
@@ -27,21 +30,35 @@ class EmbeddingsDataset(Dataset):
         row = self.data['seq_2_terms'].iloc[sample_idx]
         qseqid = row['qseqid']
 
-        feature_embed = self.data['features_embeds'][qseqid]
+        plm_embed = self.data['plm_embeds'][qseqid]
 
         true_terms_set = set(row['terms_true'])
         predicted_terms = row['terms_predicted']
         
         # Filter terms that have embeddings (should be all of them after padding)
-        # valid_terms = [term for term in predicted_terms if term in self.data['go_embeds']]
         valid_terms = predicted_terms
         # Vectorized operations using list comprehensions
         go_embeds = np.array([self.data['go_embeds'].get(term, self.mask_embed) for term in valid_terms])
         label = np.array([term in true_terms_set for term in valid_terms], dtype=np.float32)
         
+        # Get BLM embeddings from PMIDs
+        pmid_list = list(self.data['prot_2_pmid'].get(qseqid, []))
+        
+        # Skip None embeddings and collect valid ones
+        valid_blm_embeds = [self.data['pmid_2_embed'].get(pmid) for pmid in pmid_list 
+                           if self.data['pmid_2_embed'].get(pmid) is not None]
+        
+        # Create blm_embeds array - if no valid embeddings, create empty array with correct shape
+        if len(valid_blm_embeds) > 0:
+            blm_embeds = np.vstack(valid_blm_embeds)
+        else:
+            # Create empty array with shape [0, blm_dim]
+            blm_embeds = np.zeros((0, self.blm_dim), dtype=np.float32)
+        
         return {
             'entryID'   : qseqid,
-            'feature'   : feature_embed,
+            'plm_embed' : plm_embed,
+            'blm_embeds': blm_embeds,
             'go_embed'  : go_embeds,
             'label'     : label,
             'predicted_terms': valid_terms,
@@ -50,42 +67,101 @@ class EmbeddingsDataset(Dataset):
 
 
 
-def collate_tokenize(batch, tokenizer=None, device=None, dtype=torch.float32):
-    """Custom collate function to handle variable-length data.
+def simple_collate(batch):
+    """Simple collate that returns batch as-is without stacking."""
+    return batch
+
+
+def collate_with_blm_projection(batch, blm_projection_layer, tokenizer, device=None, dtype=torch.float32, 
+                                 num_plm_tokens=32, num_blm_tokens=32):
+    """
+    Custom collate function that tokenizes PLM features to 32 tokens and 
+    projects BLM features to 32 tokens, stacking them to get 64 total tokens.
     
     Args:
         batch: List of samples from the dataset
-        tokenizer: Tokenizer to apply to features (if None, tokenization happens later)
-        device: Device to move tensors to (cuda or cpu) - DEPRECATED, use None for multi-worker support
+        blm_projection_layer: nn.Linear layer to project BLM features from their dim to model_dim (512)
+        tokenizer: Tokenizer to apply to PLM features (projects to 32 tokens) - REQUIRED
+        device: Device to move tensors to (cuda or cpu)
         dtype: Target dtype for tensors (torch.float32, torch.float16, or torch.bfloat16)
+        num_plm_tokens: Number of PLM tokens (default: 32)
+        num_blm_tokens: Number of BLM tokens (default: 32)
     
-    Note: For multi-worker DataLoader support (num_workers > 0), keep device=None and 
-          move tensors to GPU after collation using PrefetchLoader or in training loop.
+    Returns:
+        Dictionary with:
+            - entryID: List of entry IDs
+            - features: Stacked PLM + BLM tokens [batch, 64, model_dim]
+            - mask: Attention mask [batch, 64]
+            - go_embed: GO embeddings [batch, num_terms, go_embed_dim]
+            - label: Labels [batch, num_terms]
+            - predicted_terms: List of predicted terms
+            - true_terms: List of true terms
     """
-    features = torch.stack([torch.from_numpy(item['feature']) for item in batch])
-    features = features.to(dtype=dtype)
+    batch_size = len(batch)
+    model_dim = blm_projection_layer.out_features
     
-    # Only tokenize if tokenizer is provided and on CPU
-    # For multi-worker support, tokenization should happen after collation
-    if tokenizer is not None:
-        # Move tokenizer to CPU if needed for worker compatibility
-        if hasattr(tokenizer, 'P_buffer') and tokenizer.P_buffer.device.type != 'cpu':
-            # Tokenizer is on GPU, which doesn't work with workers
-            # Skip tokenization here - it will be done in PrefetchLoader
-            pass
-        else:
-            features = tokenizer(features)
+    # Process PLM embeddings - stack and convert to tensors
+    plm_embeds = torch.stack([torch.from_numpy(item['plm_embed']) for item in batch])
+    plm_embeds = plm_embeds.to(dtype=dtype)
     
+    if device is not None:
+        plm_embeds = plm_embeds.to(device)
+    
+    # Tokenize PLM embeddings to fixed number of tokens (32)
+    plm_tokens = tokenizer(plm_embeds)  # [batch, 32, model_dim]
+    
+    # Process BLM embeddings - project to model_dim, cap at 32, and pad to 32
+    blm_embeds_padded = torch.zeros(batch_size, num_blm_tokens, model_dim, dtype=dtype)
+    blm_attention_mask = torch.zeros(batch_size, num_blm_tokens, dtype=torch.bool)
+    
+    if device is not None:
+        blm_embeds_padded = blm_embeds_padded.to(device)
+        blm_attention_mask = blm_attention_mask.to(device)
+    
+    for i, item in enumerate(batch):
+        blm = torch.from_numpy(item['blm_embeds']).to(dtype=dtype)  # [num_tokens, blm_dim]
+        
+        # Cap at num_blm_tokens (32)
+        actual_tokens = min(blm.shape[0], num_blm_tokens)
+        if actual_tokens > 0:
+            blm = blm[:actual_tokens]
+            
+            if device is not None:
+                blm = blm.to(device)
+            
+            # Project to model_dim (512)
+            with torch.no_grad():
+                blm_projected = blm_projection_layer(blm)  # [actual_tokens, model_dim]
+            
+            # Place in padded tensor
+            blm_embeds_padded[i, :actual_tokens] = blm_projected
+            blm_attention_mask[i, :actual_tokens] = True
+    
+    # Stack PLM tokens (32) and BLM tokens (32) to get 64 tokens total
+    features = torch.cat([plm_tokens, blm_embeds_padded], dim=1)  # [batch, 64, model_dim]
+    
+    # Create combined attention mask (PLM tokens are always valid, BLM may be padded)
+    plm_attention_mask = torch.ones(batch_size, num_plm_tokens, dtype=torch.bool)
+    if device is not None:
+        plm_attention_mask = plm_attention_mask.to(device)
+    
+    mask = torch.cat([plm_attention_mask, blm_attention_mask], dim=1)  # [batch, 64]
+    
+    # Process GO embeddings and labels
     go_embed = torch.stack([torch.from_numpy(item['go_embed']) for item in batch])
     go_embed = go_embed.to(dtype=dtype)
     
     label = torch.stack([torch.from_numpy(item['label']) for item in batch])
     label = label.to(dtype=dtype)
     
-    # Don't move to device here - let PrefetchLoader handle it
+    if device is not None:
+        go_embed = go_embed.to(device)
+        label = label.to(device)
+    
     return {
         'entryID': [item['entryID'] for item in batch],
-        'feature': features,
+        'features': features,
+        'mask': mask,
         'go_embed': go_embed,
         'label': label,
         'predicted_terms': [item['predicted_terms'] for item in batch],
@@ -93,38 +169,58 @@ def collate_tokenize(batch, tokenizer=None, device=None, dtype=torch.float32):
     }
 
 
-class PrefetchLoader:
+class PrefetchLoaderWithBLM:
     """
     Prefetch loader that loads batches asynchronously to GPU for faster training.
-    Overlaps data transfer with computation by loading the next batch while 
-    the model processes the current batch.
-    
-    Also handles tokenization on GPU if tokenizer is provided.
+    Handles PLM tokenization (32 tokens), BLM projection (32 tokens), stacking to 64 tokens.
     """
-    def __init__(self, dataloader, device, tokenizer=None, max_prefetch=1):
+    def __init__(self, dataloader, device, blm_projection_layer, tokenizer, 
+                 num_plm_tokens=32, num_blm_tokens=32, max_prefetch=1):
         self.dataloader = dataloader
         self.device = device
+        self.blm_projection_layer = blm_projection_layer
         self.tokenizer = tokenizer
-        self.max_prefetch = max_prefetch  # Limit prefetching to reduce memory usage
+        self.num_plm_tokens = num_plm_tokens
+        self.num_blm_tokens = num_blm_tokens
+        self.max_prefetch = max_prefetch
         self.stream = torch.cuda.Stream() if device.type == 'cuda' else None
+        
+        # Move projection layer to device
+        self.blm_projection_layer = self.blm_projection_layer.to(device)
+        
+        # Move tokenizer to device
+        self.tokenizer = self.tokenizer.to(device)
         
     def __iter__(self):
         if self.stream is not None:
-            # CUDA prefetching
             return self._cuda_iter()
         else:
-            # CPU fallback - no prefetching needed
-            return iter(self.dataloader)
+            return self._cpu_iter()
+    
+    def _cpu_iter(self):
+        """Iterator without prefetching for CPU."""
+        for batch in self.dataloader:
+            # Apply collate with projection and tokenization
+            batch = collate_with_blm_projection(
+                batch, 
+                self.blm_projection_layer,
+                tokenizer=self.tokenizer,
+                device=self.device, 
+                dtype=next(self.blm_projection_layer.parameters()).dtype,
+                num_plm_tokens=self.num_plm_tokens,
+                num_blm_tokens=self.num_blm_tokens
+            )
+            yield batch
     
     def _cuda_iter(self):
-        """Iterator with CUDA stream prefetching and memory management."""
+        """Iterator with CUDA stream prefetching."""
         loader_iter = iter(self.dataloader)
         
         # Preload first batch
         try:
             with torch.cuda.stream(self.stream):
                 next_batch = next(loader_iter)
-                next_batch = self._to_device(next_batch)
+                next_batch = self._process_batch(next_batch)
         except StopIteration:
             return
         
@@ -133,7 +229,7 @@ class PrefetchLoader:
             torch.cuda.current_stream().wait_stream(self.stream)
             batch = next_batch
             
-            # Make sure tensors are ready before yielding
+            # Record stream for tensors
             if isinstance(batch, dict):
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
@@ -143,33 +239,26 @@ class PrefetchLoader:
             try:
                 with torch.cuda.stream(self.stream):
                     next_batch = next(loader_iter)
-                    next_batch = self._to_device(next_batch)
+                    next_batch = self._process_batch(next_batch)
             except StopIteration:
                 yield batch
-                # Clean up
                 del batch
                 break
                 
             yield batch
-            # Free memory from previous batch
             del batch
     
-    def _to_device(self, batch):
-        """Move batch to device and apply tokenization if needed."""
-        if isinstance(batch, dict):
-            result = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    result[k] = v.to(device=self.device, non_blocking=True)
-                else:
-                    result[k] = v
-            
-            # Apply tokenizer on GPU after moving to device
-            if self.tokenizer is not None and 'feature' in result:
-                result['feature'] = self.tokenizer(result['feature'])
-            
-            return result
-        return batch
+    def _process_batch(self, batch):
+        """Process batch with PLM tokenization, BLM projection, and move to device."""
+        return collate_with_blm_projection(
+            batch,
+            self.blm_projection_layer,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            dtype=next(self.blm_projection_layer.parameters()).dtype,
+            num_plm_tokens=self.num_plm_tokens,
+            num_blm_tokens=self.num_blm_tokens
+        )
     
     def __len__(self):
         return len(self.dataloader)

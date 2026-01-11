@@ -19,7 +19,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from Dataset.Utils import load_data
 from Utils.tokenizer import EmbedTokenizer
 # from Dataset.Resample import resample
-from Dataset.EmbeddingsDataset import EmbeddingsDataset, collate_tokenize, PrefetchLoader
+from Dataset.EmbeddingsDataset import EmbeddingsDataset, simple_collate, PrefetchLoaderWithBLM
 from Model.Query2Label_pl import Query2Label_pl
 
 def train_from_configs(configs, run_name=None, resume_from_checkpoint=None, 
@@ -131,18 +131,26 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
 
                 print(f"No sampling_instances set: randomly split {len(all_idx)} indices into {len(train_idx)} train and {len(val_idx)} val (val_fraction={val_fraction}).")
 
-        # build tokenizer
-        key = next(iter(data['features_embeds']))
-        embedding_dim = int(np.asarray(data['features_embeds'][key]).shape[0])
-        token_d = int(model_configs.get('token_dim', 256))
-        num_tokens = int(model_configs.get('num_tokens', 100))
-        tokenizer = EmbedTokenizer(D=embedding_dim, d=token_d, N=num_tokens)
+        # build tokenizer for PLM embeddings
+        key = next(iter(data['plm_embeds']))
+        plm_embedding_dim = int(np.asarray(data['plm_embeds'][key]).shape[0])
+        token_d = int(model_configs.get('token_dim', 512))
+        num_plm_tokens = int(model_configs.get('num_plm_tokens', 32))
+        num_blm_tokens = int(model_configs.get('num_blm_tokens', 32))
+        tokenizer = EmbedTokenizer(D=plm_embedding_dim, d=token_d, N=num_plm_tokens)
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         try:
             tokenizer = tokenizer.to(device)
         except Exception:
             pass
+
+        # Build BLM projection layer
+        blm_key = next(iter(data['pmid_2_embed']))
+        blm_embedding_dim = int(np.asarray(data['pmid_2_embed'][blm_key]).shape[0])
+        blm_projection = torch.nn.Linear(blm_embedding_dim, token_d)
+        blm_projection = blm_projection.to(device)
+        print(f"BLM projection layer: {blm_embedding_dim} -> {token_d}")
 
         # Freeze or unfreeze tokenizer parameters based on config
         freeze_tokenizer = training_configs.get('freeze_tokenizer', True)
@@ -164,15 +172,19 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         num_workers = int(training_configs.get('num_workers', 0))
 
         # pin_memory=True for faster host-to-device transfer when num_workers > 0
-        # Tokenization now happens in PrefetchLoader on GPU, so collate_fn doesn't need device/tokenizer
+        # Use simple_collate to avoid stacking issues with variable-length BLM embeddings
         pin_memory = True if num_workers > 0 else False
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                                  pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b))
-        train_loader = PrefetchLoader(train_loader, device, tokenizer=tokenizer)
+                                  pin_memory=pin_memory, collate_fn=simple_collate)
+        train_loader = PrefetchLoaderWithBLM(train_loader, device, blm_projection_layer=blm_projection, 
+                                             tokenizer=tokenizer, num_plm_tokens=num_plm_tokens, 
+                                             num_blm_tokens=num_blm_tokens)
 
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                                pin_memory=pin_memory, collate_fn=lambda b: collate_tokenize(b))
-        val_loader = PrefetchLoader(val_loader, device, tokenizer=tokenizer)
+                                pin_memory=pin_memory, collate_fn=simple_collate)
+        val_loader = PrefetchLoaderWithBLM(val_loader, device, blm_projection_layer=blm_projection, 
+                                           tokenizer=tokenizer, num_plm_tokens=num_plm_tokens, 
+                                           num_blm_tokens=num_blm_tokens)
 
         # instantiate model
         num_classes = model_configs['max_terms']
@@ -184,7 +196,6 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
                                num_decoder_layers=model_configs.get('num_decoder_layers', 2),
                                dim_feedforward   =model_configs.get('dim_feedforward', 2048),
                                dropout           =model_configs.get('dropout', 0.1),
-                          use_positional_encoding=model_configs.get('use_positional_encoding', True),
                                lr                =training_configs.get('lr', 1e-4),
                                weight_decay      =training_configs.get('weight_decay', 1e-5),
                                # loss selection

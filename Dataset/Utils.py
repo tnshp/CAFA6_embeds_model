@@ -240,22 +240,20 @@ def load_data(data_paths, max_terms=256, aspect=None):
     
     seq_2_terms_df = data_paths['seq_2_terms_df']
     train_terms_df = data_paths['train_terms_df']
-    features_embeds_path = data_paths['features_embeds_path']
-    features_ids_path = data_paths['features_ids_path']
-
+    plm_features_path = data_paths['plm_features_path']
+    prot_2_pmid_path = data_paths['prot_2_pmid_path']
+    pmid_2_embed_path = data_paths['pmid_2_embed_path']
     go_embeds_paths = data_paths['go_embeds_paths']
 
     seq_2_terms = pd.read_parquet(seq_2_terms_df, engine='fastparquet')
     train_terms = pd.read_csv(train_terms_df, sep='\t')
 
-    print("loading features embeddings and ids")
-    features_embeds = np.load(features_embeds_path, allow_pickle=True)
-    features_ids = np.load(features_ids_path, allow_pickle=True)
+    print("Loading PLM features...")
+    plm_embeds_dict = np.load(plm_features_path, allow_pickle=True).item()
     
-    print("creating features embeddings dict")
-    
-    features_embeds_dict = {feat_id: embed for feat_id, embed in zip(features_ids, features_embeds)}
-
+    print("Loading BLM data (protein to PMID mapping and PMID embeddings)...")
+    prot_2_pmid = np.load(prot_2_pmid_path, allow_pickle=True).item()
+    pmid_2_embed = np.load(pmid_2_embed_path, allow_pickle=True).item()
 
     term_to_aspect = train_terms.groupby('term')['aspect'].first().to_dict()
 
@@ -292,19 +290,22 @@ def load_data(data_paths, max_terms=256, aspect=None):
         term_lengths_after = seq_2_terms['terms_predicted'].apply(len)
         print(f"After padding - Min: {term_lengths_after.min()}, Max: {term_lengths_after.max()}, Mean: {term_lengths_after.mean():.2f}")
 
-    
-    
-
-    print("filtering sequences by term lengths")
-   #currently only using sequences with 256 terms, need to change later 
+    print("Filtering sequences by term lengths and PLM features availability...")
+    # Currently only using sequences with max_terms, need to change later 
     # seq_2_terms = seq_2_terms[term_lengths == max_terms]
 
-    train_ids =  pd.DataFrame(features_ids, columns=['qseqid'])
-    seq_2_terms = seq_2_terms.merge(train_ids, on='qseqid', how='inner')    
+    # Filter to only include sequences that have PLM embeddings
+    plm_ids = list(plm_embeds_dict.keys())
+    train_ids = pd.DataFrame(plm_ids, columns=['qseqid'])
+    seq_2_terms = seq_2_terms.merge(train_ids, on='qseqid', how='inner')
+    
+    print(f"After filtering: {len(seq_2_terms)} sequences with both PLM features and GO terms")
 
     out = {'seq_2_terms': seq_2_terms,
            'train_terms': train_terms,
-           'features_embeds': features_embeds_dict,
+           'plm_embeds': plm_embeds_dict,
+           'prot_2_pmid': prot_2_pmid,
+           'pmid_2_embed': pmid_2_embed,
            'go_embeds': embeddings_dict,
            }
     

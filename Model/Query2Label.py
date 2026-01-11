@@ -81,8 +81,9 @@ class Query2Label(nn.Module):
         num_encoder_layers: int = 1,
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
-        dropout: float = 0.1,
-        use_positional_encoding: bool = True,
+        num_modalities: int = 2,
+        modal_idx: list = [0, 32],
+        dropout: float = 0.1    
     ):
         super().__init__()
 
@@ -92,9 +93,12 @@ class Query2Label(nn.Module):
         
         self.pos_encoder = (
             PositionalEncoding(hidden_dim, dropout=dropout)
-            if use_positional_encoding
-            else None
         )
+
+        self.modality_embeddings = nn.Parameter(
+            torch.randn(num_modalities, 1, hidden_dim) * 0.02
+        )  
+        self.modal_idx = modal_idx
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -147,9 +151,12 @@ class Query2Label(nn.Module):
         # project to hidden_dim
         src = backbone_features
 
-        # add positional encoding
-        if self.pos_encoder is not None:
-            src = self.pos_encoder(src)  # (B, L, D)
+        #add modal encoding 
+        for i in range(len(self.modal_idx)):
+            if i == len(self.modal_idx) - 1:
+                src[:, self.modal_idx[i]: , :] += self.modality_embeddings[i]
+            else:
+                src[:, self.modal_idx[i]: self.modal_idx[i+1], :] += self.modality_embeddings[i]
 
         # encode features
         memory = self.encoder(
