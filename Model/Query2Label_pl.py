@@ -132,19 +132,25 @@ class Query2Label_pl(pl.LightningModule):
             if losses:
                 loss = torch.stack(losses).mean()
         elif self.loss_function in ('WBCE', 'WEIGHTED_BCE', 'WEIGHTEDBCE'):
-            # Weighted BCE with IA scores
+            # Weighted BCE with IA scores (vectorized)
             # Get predicted terms for this batch to compute weights
             predicted_terms = batch['predicted_terms']  # List of lists of GO terms
             
-            # Compute weights: weight = IA + epsilon
-            # Shape: (B, num_classes)
-            weights = torch.zeros_like(y)
-            for i, terms_list in enumerate(predicted_terms):
-                for j, term in enumerate(terms_list):
-                    ia_score = self.ia_dict.get(term, 0.0) if self.ia_dict else 0.0
-                    weights[i, j] = ia_score + self.epsilon
+            # Vectorized weight computation
+            batch_size = len(predicted_terms)
+            num_classes = len(predicted_terms[0]) if predicted_terms else 0
             
-            # Compute weighted BCE loss manually
+            # Flatten all terms and look up IA scores in one pass
+            all_terms = [term for terms_list in predicted_terms for term in terms_list]
+            all_ia_scores = np.array([self.ia_dict.get(term, 0.0) if self.ia_dict else 0.0 for term in all_terms], dtype=np.float32)
+            
+            # Add epsilon and convert to tensor
+            all_weights = torch.from_numpy(all_ia_scores + self.epsilon).to(y.device, dtype=y.dtype)
+            
+            # Reshape to (batch_size, num_classes)
+            weights = all_weights.reshape(batch_size, num_classes)
+            
+            # Compute weighted BCE loss
             bce_loss = nn.functional.binary_cross_entropy_with_logits(
                 logits, y, weight=weights, reduction='mean'
             )
@@ -185,19 +191,25 @@ class Query2Label_pl(pl.LightningModule):
                 # Fallback to BCE if no valid pairs
                 loss = nn.functional.binary_cross_entropy_with_logits(logits, y, reduction='mean')
         elif self.loss_function in ('WBCE', 'WEIGHTED_BCE', 'WEIGHTEDBCE'):
-            # Weighted BCE with IA scores
+            # Weighted BCE with IA scores (vectorized)
             # Get predicted terms for this batch to compute weights
             predicted_terms = batch['predicted_terms']  # List of lists of GO terms
             
-            # Compute weights: weight = IA + epsilon
-            # Shape: (B, num_classes)
-            weights = torch.zeros_like(y)
-            for i, terms_list in enumerate(predicted_terms):
-                for j, term in enumerate(terms_list):
-                    ia_score = self.ia_dict.get(term, 0.0) if self.ia_dict else 0.0
-                    weights[i, j] = ia_score + self.epsilon
+            # Vectorized weight computation
+            batch_size = len(predicted_terms)
+            num_classes = len(predicted_terms[0]) if predicted_terms else 0
             
-            # Compute weighted BCE loss manually
+            # Flatten all terms and look up IA scores in one pass
+            all_terms = [term for terms_list in predicted_terms for term in terms_list]
+            all_ia_scores = np.array([self.ia_dict.get(term, 0.0) if self.ia_dict else 0.0 for term in all_terms], dtype=np.float32)
+            
+            # Add epsilon and convert to tensor
+            all_weights = torch.from_numpy(all_ia_scores + self.epsilon).to(y.device, dtype=y.dtype)
+            
+            # Reshape to (batch_size, num_classes)
+            weights = all_weights.reshape(batch_size, num_classes)
+            
+            # Compute weighted BCE loss
             bce_loss = nn.functional.binary_cross_entropy_with_logits(
                 logits, y, weight=weights, reduction='sum'
             )
