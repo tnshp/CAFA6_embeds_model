@@ -211,7 +211,7 @@ class Query2Label_pl(pl.LightningModule):
             
             # Compute weighted BCE loss
             bce_loss = nn.functional.binary_cross_entropy_with_logits(
-                logits, y, weight=weights, reduction='sum'
+                logits, y, weight=weights, reduction='mean'
             )
             loss = bce_loss
         else:
