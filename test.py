@@ -75,21 +75,15 @@ class EmbeddingsTestDataset(Dataset):
 
 def prepare_data_test(data_paths, max_terms=256, aspect=None):
     
-    seq_2_terms_df = data_paths['seq_2_terms_df']
-    train_terms_df = data_paths.get('train_terms_df', None)
+    seq_2_terms_df    = data_paths['seq_2_terms_df']
     plm_features_path = data_paths['plm_features_path']
-    prot_2_pmid_path = data_paths['prot_2_pmid_path']
+    prot_2_pmid_path  = data_paths['prot_2_pmid_path']
     pmid_2_embed_path = data_paths['pmid_2_embed_path']
+    go_obo_path       = data_paths['go_obo_path']
 
     go_embeds_paths = data_paths['go_embeds_paths']
 
     seq_2_terms = pd.read_parquet(seq_2_terms_df, engine='fastparquet')
-
-    if train_terms_df is not None:
-        train_terms = pd.read_csv(train_terms_df, sep='\t')
-        term_to_aspect = train_terms.groupby('term')['aspect'].first().to_dict()
-    else:
-        term_to_aspect = None
 
     print("Loading PLM features...")
     plm_features = np.load(plm_features_path, allow_pickle=True).item()
@@ -97,6 +91,28 @@ def prepare_data_test(data_paths, max_terms=256, aspect=None):
     print("Loading BLM data (protein to PMID mapping and PMID embeddings)...")
     prot_2_pmid = np.load(prot_2_pmid_path, allow_pickle=True).item()
     pmid_2_embed = np.load(pmid_2_embed_path, allow_pickle=True).item()
+    
+    print("Loading GO graph...")
+    go_graph = obonet.read_obo(go_obo_path)
+    
+    # Construct term_to_aspect dictionary from GO graph
+    go_term_to_aspect = {}
+    
+    # Mapping of namespace to aspect
+    namespace_to_aspect = {
+        'biological_process': 'P',
+        'molecular_function': 'F',
+        'cellular_component': 'C'
+    }
+    
+    # Iterate through all nodes in the GO graph
+    for go_id, data in go_graph.nodes(data=True):
+        namespace = data.get('namespace', '')
+        aspect_code = namespace_to_aspect.get(namespace, None)
+        if aspect_code:
+            go_term_to_aspect[go_id] = aspect_code
+    
+    print(f"Loaded {len(go_term_to_aspect)} GO terms with aspect mappings")
         
     with open(go_embeds_paths, 'rb') as f:
         data = pickle.load(f)
@@ -105,17 +121,20 @@ def prepare_data_test(data_paths, max_terms=256, aspect=None):
     
     # Filter to keep only terms from a specific aspect if aspect is provided
     print(f'Filtering by aspect: {aspect}')
-    if aspect is not None and term_to_aspect is not None:
+    if aspect is not None:
         seq_2_terms['terms_predicted'] = seq_2_terms['terms_predicted'].apply(
-            lambda terms: [t for t in terms if term_to_aspect.get(t) == aspect]
+            lambda terms: [t for t in terms if go_term_to_aspect.get(t) == aspect]
         )
         # Remove rows where terms_predicted is now empty
         seq_2_terms = seq_2_terms[seq_2_terms['terms_predicted'].apply(len) > 0]
-
+        term_lengths = seq_2_terms['terms_predicted'].apply(len)
+        print(f"After aspect filtering -  Mean: {term_lengths.mean():.2f}, Min: {term_lengths.min()}, Max: {term_lengths.max()}")
+        print(f"After aspect filtering: {len(seq_2_terms)} sequences")
+        print(f"After filtering ")
         # Pad terms with random terms from the same aspect
         print(f"Padding terms_predicted with random terms from aspect {aspect}...")
         # Get all terms from this aspect that have embeddings
-        aspect_terms = [term for term, asp in term_to_aspect.items() if asp == aspect and term in embeddings_dict]
+        aspect_terms = [term for term, asp in go_term_to_aspect.items() if asp == aspect and term in embeddings_dict]
         all_aspect_terms = np.array(aspect_terms)
         
         tqdm.pandas(desc=f"Padding with random {aspect} terms")
@@ -320,16 +339,16 @@ def main():
     output_dir = "/mnt/d/ML/Kaggle/CAFA6-new/predictions_output/"
     
     # Probability threshold - only predictions above this will be included
-    threshold = 0.5
+    threshold = 0.2
     
     # Data paths
     data_paths =  {
         "seq_2_terms_df":       "/mnt/d/ML/Kaggle/CAFA6-new/data_packet_test/seq_2_terms.parquet",
-        "train_terms_df":       "/mnt/d/ML/Kaggle/CAFA6/cafa-6-protein-function-prediction/Train/train_terms.tsv",
         "plm_features_path":    "/mnt/d/ML/Kaggle/CAFA6-new/data_packet1/plm_features.npy",
         "prot_2_pmid_path":     "/mnt/d/ML/Kaggle/CAFA6-new/data_packet_test/prot_2_pmid.npy",
         "pmid_2_embed_path":    "/mnt/d/ML/Kaggle/CAFA6-new/data_packet_test/pmid_2_embed.npy",
         "go_embeds_paths":      "/mnt/d/ML/Kaggle/CAFA6-new/data_packet1/go_embeddings.pkl",
+        "go_obo_path":          "/mnt/d/ML/Kaggle/CAFA6/cafa-6-protein-function-prediction/Train/go-basic.obo",
     }
     
     # Create output directory

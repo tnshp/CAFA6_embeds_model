@@ -30,12 +30,15 @@ class Query2Label_pl(pl.LightningModule):
         disable_torch_grad_focal_loss: bool = True,
         # Top-k filtering for validation
         top_k_predictions: int = None,
-        # IA (Information Accretion) weights for F1 computation
+        # IA (Information Accretion) weights for F1 computation and WBCE loss
         ia_dict: dict = None,
+        # Epsilon for WBCE loss (to handle zero IA scores)
+        epsilon: float = 0.5,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['ia_dict'])  # Don't save ia_dict in hparams
         self.ia_dict = ia_dict  # Store separately
+        self.epsilon = epsilon  # Store epsilon for WBCE
 
         self.model = Query2Label(
             num_classes=num_classes,
@@ -69,13 +72,15 @@ class Query2Label_pl(pl.LightningModule):
                     disable_torch_grad_focal_loss=disable_torch_grad_focal_loss,
                 )
         elif lf in ('BCE', 'BCEWITHLOGITS', 'BCEWITHLOGITSLOSS'):
-            # Use BCEWithLogitsLoss; set reduction='sum' to match ASL sum-based scale
-            self.criterion = nn.BCEWithLogitsLoss(reduction='sum')
+            self.criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        elif lf in ('WBCE', 'WEIGHTED_BCE', 'WEIGHTEDBCE'):
+            # Weighted BCE with IA scores - will compute weights in training/validation steps
+            self.criterion = None  # Will use weighted BCE manually with ia_dict
         elif lf in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
             # RankLoss uses RankLossPair class
             self.criterion = RankLossPair(reduction='mean')
         else:
-            raise ValueError(f"Unsupported loss_function: {loss_function}. Supported: 'ASL', 'BCE', 'RankLoss'.")
+            raise ValueError(f"Unsupported loss_function: {loss_function}. Supported: 'ASL', 'BCE', 'WBCE', 'RankLoss'.")
         
         # Store loss function name for training step
         self.loss_function = lf
@@ -126,6 +131,24 @@ class Query2Label_pl(pl.LightningModule):
             
             if losses:
                 loss = torch.stack(losses).mean()
+        elif self.loss_function in ('WBCE', 'WEIGHTED_BCE', 'WEIGHTEDBCE'):
+            # Weighted BCE with IA scores
+            # Get predicted terms for this batch to compute weights
+            predicted_terms = batch['predicted_terms']  # List of lists of GO terms
+            
+            # Compute weights: weight = IA + epsilon
+            # Shape: (B, num_classes)
+            weights = torch.zeros_like(y)
+            for i, terms_list in enumerate(predicted_terms):
+                for j, term in enumerate(terms_list):
+                    ia_score = self.ia_dict.get(term, 0.0) if self.ia_dict else 0.0
+                    weights[i, j] = ia_score + self.epsilon
+            
+            # Compute weighted BCE loss manually
+            bce_loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, y, weight=weights, reduction='mean'
+            )
+            loss = bce_loss
         else:
             # Standard loss functions (ASL, BCE)
             loss = self.criterion(logits, y)
@@ -161,6 +184,24 @@ class Query2Label_pl(pl.LightningModule):
             else:
                 # Fallback to BCE if no valid pairs
                 loss = nn.functional.binary_cross_entropy_with_logits(logits, y, reduction='mean')
+        elif self.loss_function in ('WBCE', 'WEIGHTED_BCE', 'WEIGHTEDBCE'):
+            # Weighted BCE with IA scores
+            # Get predicted terms for this batch to compute weights
+            predicted_terms = batch['predicted_terms']  # List of lists of GO terms
+            
+            # Compute weights: weight = IA + epsilon
+            # Shape: (B, num_classes)
+            weights = torch.zeros_like(y)
+            for i, terms_list in enumerate(predicted_terms):
+                for j, term in enumerate(terms_list):
+                    ia_score = self.ia_dict.get(term, 0.0) if self.ia_dict else 0.0
+                    weights[i, j] = ia_score + self.epsilon
+            
+            # Compute weighted BCE loss manually
+            bce_loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, y, weight=weights, reduction='sum'
+            )
+            loss = bce_loss
         else:
             # Standard loss functions (ASL, BCE)
             loss = self.criterion(logits, y)

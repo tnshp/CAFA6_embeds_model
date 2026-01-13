@@ -206,8 +206,10 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
                                clip     =float(training_configs.get('clip', 0.05)),
                                loss_eps =float(training_configs.get('loss_eps', 1e-8)),
                                disable_torch_grad_focal_loss=bool(training_configs.get('disable_torch_grad_focal_loss', True)),
-                               # IA weighting for F1 computation
-                               ia_dict=ia_dict)
+                               # IA weighting for F1 computation and WBCE loss
+                               ia_dict=ia_dict,
+                               # Epsilon for WBCE loss
+                               epsilon=float(training_configs.get('epsilon', 0.5)))
 
         # compute total steps for scheduler and set on model.hparams
         max_epochs = int(training_configs.get('max_epochs', 10))
