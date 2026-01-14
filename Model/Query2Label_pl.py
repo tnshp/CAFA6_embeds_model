@@ -23,6 +23,8 @@ class Query2Label_pl(pl.LightningModule):
         dropout: float = 0.1,
         # Loss selection: 'ASL' or 'BCE'
         loss_function: str = 'ASL',
+        lr : float = 1e-4,
+        weight_decay: float = 1e-5,
         # Asymmetric loss parameters
         gamma_neg: float = 4.0,
         gamma_pos: float = 0.0,
@@ -42,6 +44,8 @@ class Query2Label_pl(pl.LightningModule):
         self.save_hyperparameters(ignore=['ia_dict'])  # Don't save ia_dict in hparams
         self.ia_dict = ia_dict  # Store separately
         self.epsilon = epsilon  # Store epsilon for WBCE
+        self.lr = lr
+        self.weight_decay = weight_decay
 
         self.model = Query2Label(
             num_classes=num_classes,
@@ -495,8 +499,8 @@ class Query2Label_pl(pl.LightningModule):
 
     def configure_optimizers(self):
         # Use AdamW; hyperparameters were saved in self.hparams by save_hyperparameters()
-        lr = self.hparams.get('lr', 1e-4) if isinstance(self.hparams, dict) else getattr(self.hparams, 'lr', 1e-4)
-        weight_decay = self.hparams.get('weight_decay', 1e-5) if isinstance(self.hparams, dict) else getattr(self.hparams, 'weight_decay', 1e-5)
+        lr = self.lr if hasattr(self, 'lr') else (self.hparams.get('lr', 1e-4) if isinstance(self.hparams, dict) else getattr(self.hparams, 'lr', 1e-4))
+        weight_decay = self.weight_decay if hasattr(self, 'weight_decay') else (self.hparams.get('weight_decay', 1e-5) if isinstance(self.hparams, dict) else getattr(self.hparams, 'weight_decay', 1e-5))
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
 
         # Use ReduceLROnPlateau scheduler (monitoring validation metric 'val_fmax_macro').
