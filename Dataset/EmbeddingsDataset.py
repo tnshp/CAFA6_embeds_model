@@ -72,6 +72,96 @@ def simple_collate(batch):
     return batch
 
 
+def collate_with_raw_features(batch, device=None, dtype=torch.float32, num_blm_tokens=32):
+    """
+    Collate function that prepares raw PLM and BLM features for the model to project internally.
+    This ensures projection layers are part of the model and get saved with checkpoints.
+    
+    Args:
+        batch: List of samples from the dataset
+        device: Device to move tensors to (cuda or cpu)
+        dtype: Target dtype for tensors (torch.float32, torch.float16, or torch.bfloat16)
+        num_blm_tokens: Number of BLM tokens to pad to (default: 32)
+    
+    Returns:
+        Dictionary with:
+            - entryID: List of entry IDs
+            - plm_raw: Raw PLM embeddings [batch, plm_dim]
+            - blm_raw: Raw BLM embeddings [batch, num_blm_tokens, blm_dim]
+            - blm_mask: BLM attention mask [batch, num_blm_tokens] (True = valid)
+            - go_embed: GO embeddings [batch, num_terms, go_embed_dim]
+            - label: Labels [batch, num_terms]
+            - predicted_terms: List of predicted terms
+            - true_terms: List of true terms
+    """
+    batch_size = len(batch)
+    
+    # Stack PLM embeddings
+    plm_raw = torch.stack([torch.from_numpy(item['plm_embed']) for item in batch])
+    plm_raw = plm_raw.to(dtype=dtype)
+    if device is not None:
+        plm_raw = plm_raw.to(device)
+    
+    # Get BLM dimension from first item
+    blm_dim = batch[0]['blm_embeds'].shape[1] if batch[0]['blm_embeds'].shape[0] > 0 else 0
+    
+    # If blm_dim is 0, get it from data
+    if blm_dim == 0:
+        # Find first sample with BLM embeddings
+        for item in batch:
+            if item['blm_embeds'].shape[0] > 0:
+                blm_dim = item['blm_embeds'].shape[1]
+                break
+    
+    # If still 0, use a default (this shouldn't happen in practice)
+    if blm_dim == 0:
+        blm_dim = 768  # Default dimension
+    
+    # Prepare padded BLM embeddings and mask
+    blm_raw = torch.zeros(batch_size, num_blm_tokens, blm_dim, dtype=dtype)
+    blm_mask = torch.zeros(batch_size, num_blm_tokens, dtype=torch.bool)
+    
+    if device is not None:
+        blm_raw = blm_raw.to(device)
+        blm_mask = blm_mask.to(device)
+    
+    for i, item in enumerate(batch):
+        blm = torch.from_numpy(item['blm_embeds']).to(dtype=dtype)  # [num_tokens, blm_dim]
+        
+        # Cap at num_blm_tokens
+        actual_tokens = min(blm.shape[0], num_blm_tokens)
+        if actual_tokens > 0:
+            blm = blm[:actual_tokens]
+            if device is not None:
+                blm = blm.to(device)
+            
+            # Place in padded tensor
+            blm_raw[i, :actual_tokens] = blm
+            blm_mask[i, :actual_tokens] = True
+    
+    # Process GO embeddings and labels
+    go_embed = torch.stack([torch.from_numpy(item['go_embed']) for item in batch])
+    go_embed = go_embed.to(dtype=dtype)
+    
+    label = torch.stack([torch.from_numpy(item['label']) for item in batch])
+    label = label.to(dtype=dtype)
+    
+    if device is not None:
+        go_embed = go_embed.to(device)
+        label = label.to(device)
+    
+    return {
+        'entryID': [item['entryID'] for item in batch],
+        'plm_raw': plm_raw,
+        'blm_raw': blm_raw,
+        'blm_mask': blm_mask,
+        'go_embed': go_embed,
+        'label': label,
+        'predicted_terms': [item['predicted_terms'] for item in batch],
+        'true_terms': [item['true_terms'] for item in batch]
+    }
+
+
 def collate_with_blm_projection(batch, blm_projection_layer, tokenizer, device=None, dtype=torch.float32, 
                                  num_plm_tokens=32, num_blm_tokens=32):
     """
@@ -257,6 +347,86 @@ class PrefetchLoaderWithBLM:
             device=self.device,
             dtype=next(self.blm_projection_layer.parameters()).dtype,
             num_plm_tokens=self.num_plm_tokens,
+            num_blm_tokens=self.num_blm_tokens
+        )
+    
+    def __len__(self):
+        return len(self.dataloader)
+
+
+class PrefetchLoaderWithRawFeatures:
+    """
+    Prefetch loader that loads batches asynchronously to GPU for faster training.
+    Prepares raw PLM and BLM features for the model to project internally.
+    This ensures projection layers are part of the model and saved with checkpoints.
+    """
+    def __init__(self, dataloader, device, num_blm_tokens=32, max_prefetch=1):
+        self.dataloader = dataloader
+        self.device = device
+        self.num_blm_tokens = num_blm_tokens
+        self.max_prefetch = max_prefetch
+        self.stream = torch.cuda.Stream() if device.type == 'cuda' else None
+        
+    def __iter__(self):
+        if self.stream is not None:
+            return self._cuda_iter()
+        else:
+            return self._cpu_iter()
+    
+    def _cpu_iter(self):
+        """Iterator without prefetching for CPU."""
+        for batch in self.dataloader:
+            # Apply collate with raw features
+            batch = collate_with_raw_features(
+                batch, 
+                device=self.device, 
+                dtype=torch.float32,
+                num_blm_tokens=self.num_blm_tokens
+            )
+            yield batch
+    
+    def _cuda_iter(self):
+        """Iterator with CUDA stream prefetching."""
+        loader_iter = iter(self.dataloader)
+        
+        # Preload first batch
+        try:
+            with torch.cuda.stream(self.stream):
+                next_batch = next(loader_iter)
+                next_batch = self._process_batch(next_batch)
+        except StopIteration:
+            return
+        
+        while True:
+            # Wait for the prefetch stream to finish
+            torch.cuda.current_stream().wait_stream(self.stream)
+            batch = next_batch
+            
+            # Record stream for tensors
+            if isinstance(batch, dict):
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        v.record_stream(torch.cuda.current_stream())
+            
+            # Start loading next batch in background
+            try:
+                with torch.cuda.stream(self.stream):
+                    next_batch = next(loader_iter)
+                    next_batch = self._process_batch(next_batch)
+            except StopIteration:
+                yield batch
+                del batch
+                break
+                
+            yield batch
+            del batch
+    
+    def _process_batch(self, batch):
+        """Process batch with raw features and move to device."""
+        return collate_with_raw_features(
+            batch,
+            device=self.device,
+            dtype=torch.float32,
             num_blm_tokens=self.num_blm_tokens
         )
     

@@ -13,13 +13,14 @@ class Query2Label_pl(pl.LightningModule):
         self,
         num_classes: int,
         in_dim: int,
+        plm_dim: int = None,
+        blm_dim: int = None,
+        num_plm_tokens: int = 32,
         nheads: int = 8,
         num_encoder_layers: int = 1,
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
-        lr: float = 1e-4,
-        weight_decay: float = 1e-5,
         # Loss selection: 'ASL' or 'BCE'
         loss_function: str = 'ASL',
         # Asymmetric loss parameters
@@ -34,6 +35,8 @@ class Query2Label_pl(pl.LightningModule):
         ia_dict: dict = None,
         # Epsilon for WBCE loss (to handle zero IA scores)
         epsilon: float = 0.5,
+        # Classifier type: shared layer or multi-class
+        use_shared_classifier: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['ia_dict'])  # Don't save ia_dict in hparams
@@ -43,11 +46,15 @@ class Query2Label_pl(pl.LightningModule):
         self.model = Query2Label(
             num_classes=num_classes,
             in_dim=in_dim,
+            plm_dim=plm_dim,
+            blm_dim=blm_dim,
+            num_plm_tokens=num_plm_tokens,
             nheads=nheads,
             num_encoder_layers=num_encoder_layers,
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
-            dropout=dropout
+            dropout=dropout,
+            use_shared_classifier=use_shared_classifier
         )
 
     
@@ -96,25 +103,34 @@ class Query2Label_pl(pl.LightningModule):
         # Store top-k parameter
         self.top_k_predictions = top_k_predictions
 
-    def forward(self, x: torch.Tensor, f: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        # Invert mask: PyTorch expects True for positions to IGNORE, we have True for VALID positions
-        if mask is not None:
-            mask = ~mask
-        return self.model(x, f, src_key_padding_mask=mask) 
+    def forward(self, x: torch.Tensor, plm_raw: torch.Tensor, blm_raw: torch.Tensor, blm_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass with raw features (model projects internally).
+        
+        Args:
+            x: GO embeddings (query) - (B, num_classes, D)
+            plm_raw: Raw PLM features - (B, plm_dim)
+            blm_raw: Raw BLM features - (B, max_blm_tokens, blm_dim)
+            blm_mask: Mask for BLM features - (B, max_blm_tokens) with True for VALID positions
+        
+        Returns:
+            logits: (B, num_classes)
+        """
+        return self.model(x, backbone_features=None, plm_features=plm_raw, 
+                        blm_features=blm_raw, blm_mask=blm_mask, src_key_padding_mask=None) 
 
     def training_step(self, batch, batch_idx):
         """Standard training step.
 
-        Expects `batch` to be a dict with keys `'tokens'` and `'label'` where
-        - `tokens` is a float Tensor of shape (B, L, C_in)
-        - `label` is a binary Tensor of shape (B, num_classes)
+        Expects `batch` to be a dict with keys for GO embeddings, raw features, and labels.
         """
-        x = batch['go_embed']   # (B, L, C_in)
-        f = batch['features']   
+        x = batch['go_embed']   # (B, num_classes, go_embed_dim)
         y = batch['label']
-        mask = batch.get('mask', None)  # (B, L) attention mask
-
-        logits = self.forward(x, f, mask)
+        plm_raw = batch['plm_raw']
+        blm_raw = batch['blm_raw']
+        blm_mask = batch.get('blm_mask', None)
+        
+        logits = self.forward(x, plm_raw=plm_raw, blm_raw=blm_raw, blm_mask=blm_mask)
         
         # Calculate loss based on loss function type
         if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):
@@ -165,12 +181,13 @@ class Query2Label_pl(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         """Validation step computes loss and stores for F-max computation."""
-        x = batch['go_embed']   # (B, L, C_in)
-        f = batch['features']   
+        x = batch['go_embed']   # (B, num_classes, go_embed_dim)
         y = batch['label']
-        mask = batch.get('mask', None)  # (B, L) attention mask
-
-        logits = self.forward(x, f, mask)
+        plm_raw = batch['plm_raw']
+        blm_raw = batch['blm_raw']
+        blm_mask = batch.get('blm_mask', None)
+        
+        logits = self.forward(x, plm_raw=plm_raw, blm_raw=blm_raw, blm_mask=blm_mask)
         
         # Calculate loss based on loss function type
         if self.loss_function in ('RANK', 'RANKLOSS', 'RANK_LOSS'):

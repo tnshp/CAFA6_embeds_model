@@ -4,13 +4,11 @@ import os
 import torch
 import json
 import pickle
-import obonet
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 
 from Model.Query2Label_pl import Query2Label_pl
-from Utils.tokenizer import EmbedTokenizer
-from Dataset.EmbeddingsDataset import simple_collate, PrefetchLoaderWithBLM
+from Dataset.EmbeddingsDataset import simple_collate, PrefetchLoaderWithRawFeatures
 from Dataset.Utils import pad_with_random_terms
 
 
@@ -79,7 +77,7 @@ def prepare_data_test(data_paths, max_terms=256, aspect=None):
     plm_features_path = data_paths['plm_features_path']
     prot_2_pmid_path  = data_paths['prot_2_pmid_path']
     pmid_2_embed_path = data_paths['pmid_2_embed_path']
-    go_obo_path       = data_paths['go_obo_path']
+    go_term_to_aspect_path = data_paths.get('go_term_to_aspect_path', '/mnt/d/ML/Kaggle/CAFA6-new/data_packet1/go_term_to_aspect.npy')
 
     go_embeds_paths = data_paths['go_embeds_paths']
 
@@ -92,25 +90,8 @@ def prepare_data_test(data_paths, max_terms=256, aspect=None):
     prot_2_pmid = np.load(prot_2_pmid_path, allow_pickle=True).item()
     pmid_2_embed = np.load(pmid_2_embed_path, allow_pickle=True).item()
     
-    print("Loading GO graph...")
-    go_graph = obonet.read_obo(go_obo_path)
-    
-    # Construct term_to_aspect dictionary from GO graph
-    go_term_to_aspect = {}
-    
-    # Mapping of namespace to aspect
-    namespace_to_aspect = {
-        'biological_process': 'P',
-        'molecular_function': 'F',
-        'cellular_component': 'C'
-    }
-    
-    # Iterate through all nodes in the GO graph
-    for go_id, data in go_graph.nodes(data=True):
-        namespace = data.get('namespace', '')
-        aspect_code = namespace_to_aspect.get(namespace, None)
-        if aspect_code:
-            go_term_to_aspect[go_id] = aspect_code
+    print("Loading GO term to aspect mapping...")
+    go_term_to_aspect = np.load(go_term_to_aspect_path, allow_pickle=True).item()
     
     print(f"Loaded {len(go_term_to_aspect)} GO terms with aspect mappings")
         
@@ -172,7 +153,7 @@ def prepare_data_test(data_paths, max_terms=256, aspect=None):
 
 
 def load_model_and_tokenizer(model_dir, device):
-    """Load model and tokenizer from checkpoint directory."""
+    """Load model from checkpoint directory."""
     print(f"Loading model from {model_dir}...")
     
     # Load configs
@@ -198,34 +179,14 @@ def load_model_and_tokenizer(model_dir, device):
     model.eval()
     model = model.to(device)
     print(f"Model loaded successfully with {sum(p.numel() for p in model.parameters())} parameters")
+    print("Using model with internal projection layers")
     
-    # Build and load tokenizer
-    token_d = int(model_configs.get('token_dim', 512))
-    num_plm_tokens = int(model_configs.get('num_plm_tokens', 32))
-    
-    tokenizer = EmbedTokenizer(D=1280, d=token_d, N=num_plm_tokens)
-    
-    # Load tokenizer state
-    tokenizer_path = os.path.join(model_dir, "tokenizer_state_dict.pt")
-    tokenizer_state = torch.load(tokenizer_path, map_location='cpu')
-    tokenizer.load_state_dict(tokenizer_state)
-    
-    tokenizer = tokenizer.to(device)
-    tokenizer.eval()
-    print(f"Tokenizer loaded successfully on {device}")
-    
-    # Build BLM projection layer
     num_blm_tokens = int(model_configs.get('num_blm_tokens', 32))
-    blm_dim = 768  # Default BioLM dimension
-    blm_projection = torch.nn.Linear(blm_dim, token_d)
-    blm_projection = blm_projection.to(device)
-    blm_projection.eval()
-    print(f"BLM projection layer: {blm_dim} -> {token_d}")
     
-    return model, tokenizer, blm_projection, num_plm_tokens, num_blm_tokens, configs
+    return model, num_blm_tokens, configs
 
 
-def run_inference(model, tokenizer, blm_projection, num_plm_tokens, num_blm_tokens, data, configs, device):
+def run_inference(model, num_blm_tokens, data, configs, device):
     """Run inference on data and return predictions array."""
     print("Creating dataset and dataloader...")
     
@@ -245,12 +206,9 @@ def run_inference(model, tokenizer, blm_projection, num_plm_tokens, num_blm_toke
         collate_fn=simple_collate
     )
     
-    # Wrap with PrefetchLoaderWithBLM for GPU tokenization and BLM projection
-    test_loader = PrefetchLoaderWithBLM(
-        test_loader, device, 
-        blm_projection_layer=blm_projection, 
-        tokenizer=tokenizer,
-        num_plm_tokens=num_plm_tokens,
+    print("Using raw features loader (model has internal projections)")
+    test_loader = PrefetchLoaderWithRawFeatures(
+        test_loader, device,
         num_blm_tokens=num_blm_tokens
     )
     
@@ -264,12 +222,12 @@ def run_inference(model, tokenizer, blm_projection, num_plm_tokens, num_blm_toke
     with torch.no_grad():
         for i, batch in enumerate(tqdm(test_loader, desc="Inference")):
             x = batch['go_embed']
-            f = batch['features']
-            mask = batch.get('mask', None)
             true_labels = batch['label']
+            plm_raw = batch['plm_raw']
+            blm_raw = batch['blm_raw']
+            blm_mask = batch.get('blm_mask', None)
             
-            # Forward pass
-            logits = model(x, f, mask)
+            logits = model(x, plm_raw=plm_raw, blm_raw=blm_raw, blm_mask=blm_mask)
             probs = torch.sigmoid(logits)
             
             # Move to CPU and store as numpy arrays
@@ -280,7 +238,7 @@ def run_inference(model, tokenizer, blm_projection, num_plm_tokens, num_blm_toke
             true_list.append(labels_cpu)
             
             # Free memory
-            del logits, probs, probs_cpu, labels_cpu, x, f
+            del logits, probs, probs_cpu, labels_cpu, x, plm_raw, blm_raw
     
     # Stack all predictions
     predictions_array = np.vstack(predictions_list)
@@ -291,7 +249,7 @@ def run_inference(model, tokenizer, blm_projection, num_plm_tokens, num_blm_toke
     return predictions_array, true_array, all_indices
 
 
-def create_predictions_dataframe(predictions_array, entry_ids, terms_lists, threshold=0.5):
+def create_predictions_dataframe(predictions_array, entry_ids, terms_lists, threshold=0.5, top_k=None):
     """
     Create predictions DataFrame from arrays.
     
@@ -300,6 +258,7 @@ def create_predictions_dataframe(predictions_array, entry_ids, terms_lists, thre
         entry_ids: List of N entry IDs
         terms_lists: List of N term lists (each with M terms)
         threshold: Only include predictions with score >= threshold
+        top_k: If not None, only keep top-k predictions per entry (after threshold filtering)
     
     Returns:
         predictions_df: DataFrame with ['EntryID', 'term', 'score']
@@ -319,6 +278,10 @@ def create_predictions_dataframe(predictions_array, entry_ids, terms_lists, thre
         if len(filtered_indices) > 0:
             sorted_filtered_indices = filtered_indices[np.argsort(scores[filtered_indices])[::-1]]
             
+            # Apply top-k filtering if specified
+            if top_k is not None:
+                sorted_filtered_indices = sorted_filtered_indices[:top_k]
+            
             # Add predictions above threshold
             for idx in sorted_filtered_indices:
                 pred_records.append({
@@ -331,15 +294,17 @@ def create_predictions_dataframe(predictions_array, entry_ids, terms_lists, thre
     
     return predictions_df
 
-
 def main():
     """Main testing loop to generate predictions."""
-    # Configuration
-    model_dir = "/mnt/d/ML/Kaggle/CAFA6-new/checkpoints/default_run/"
+    # Configuration``
+    model_dir = "/mnt/d/ML/Kaggle/CAFA6-new/checkpoints/shared_classifier_F/"
     output_dir = "/mnt/d/ML/Kaggle/CAFA6-new/predictions_output/"
     
     # Probability threshold - only predictions above this will be included
-    threshold = 0.2
+    threshold = 0.05
+    
+    # Top-k filtering - only keep top k predictions per entry (None = keep all)
+    top_k = None
     
     # Data paths
     data_paths =  {
@@ -348,7 +313,7 @@ def main():
         "prot_2_pmid_path":     "/mnt/d/ML/Kaggle/CAFA6-new/data_packet_test/prot_2_pmid.npy",
         "pmid_2_embed_path":    "/mnt/d/ML/Kaggle/CAFA6-new/data_packet_test/pmid_2_embed.npy",
         "go_embeds_paths":      "/mnt/d/ML/Kaggle/CAFA6-new/data_packet1/go_embeddings.pkl",
-        "go_obo_path":          "/mnt/d/ML/Kaggle/CAFA6/cafa-6-protein-function-prediction/Train/go-basic.obo",
+        "go_term_to_aspect_path": "/mnt/d/ML/Kaggle/CAFA6-new/data_packet1/go_term_to_aspect.npy",
     }
     
     # Create output directory
@@ -358,8 +323,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load model, tokenizer, and BLM projection layer
-    model, tokenizer, blm_projection, num_plm_tokens, num_blm_tokens, configs = load_model_and_tokenizer(model_dir, device)
+    # Load model
+    model, num_blm_tokens, configs = load_model_and_tokenizer(model_dir, device)
     
     # Prepare data
     print("\nPreparing data...")
@@ -372,7 +337,7 @@ def main():
     # Run inference
     print("\nRunning inference...")
     predictions_array, true_array, all_indices = run_inference(
-        model, tokenizer, blm_projection, num_plm_tokens, num_blm_tokens, data, configs, device
+        model, num_blm_tokens, data, configs, device
     )
     
     # Extract entry IDs and terms
@@ -388,11 +353,14 @@ def main():
     
     # Generate predictions with threshold filtering
     print(f"\n{'='*60}")
-    print(f"Generating predictions with threshold >= {threshold}")
+    if top_k is not None:
+        print(f"Generating predictions with threshold >= {threshold} and top-{top_k} per entry")
+    else:
+        print(f"Generating predictions with threshold >= {threshold}")
     print(f"{'='*60}")
     
     pred_df = create_predictions_dataframe(
-        predictions_array, entry_ids_list, terms_list, threshold=threshold
+        predictions_array, entry_ids_list, terms_list, threshold=threshold, top_k=top_k
     )
     
     print(f"Total predictions: {len(pred_df)}")
@@ -402,7 +370,10 @@ def main():
     print(f"Score range: [{pred_df['score'].min():.4f}, {pred_df['score'].max():.4f}]")
     
     # Save predictions to file
-    output_file = os.path.join(output_dir, f"predictions_{aspect}_threshold{threshold}.tsv")
+    if top_k is not None:
+        output_file = os.path.join(output_dir, f"predictions_{aspect}_threshold{threshold}_top{top_k}.tsv")
+    else:
+        output_file = os.path.join(output_dir, f"predictions_{aspect}_threshold{threshold}.tsv")
     pred_df.to_csv(output_file, sep='\t', index=False)
     print(f"\nPredictions saved to: {output_file}")
     

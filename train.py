@@ -17,9 +17,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Learning
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from Dataset.Utils import load_data
-from Utils.tokenizer import EmbedTokenizer
-# from Dataset.Resample import resample
-from Dataset.EmbeddingsDataset import EmbeddingsDataset, simple_collate, PrefetchLoaderWithBLM
+from Dataset.EmbeddingsDataset import EmbeddingsDataset, simple_collate, PrefetchLoaderWithRawFeatures
 from Model.Query2Label_pl import Query2Label_pl
 
 def train_from_configs(configs, run_name=None, resume_from_checkpoint=None, 
@@ -94,74 +92,34 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
             unique_train_idx = np.array(train_idx)
             
         else:
-            # Fallback to original random split behavior
-            print("No predefined split found, using random split...")
-            sampling_instances = training_configs.get('sampling_instances', None)
-            val_fraction = float(training_configs.get('val_fraction', 0.3))
-            seed = training_configs.get('seed', None)
+            # No sampling_instances provided: split indices randomly into train/val according to val_fraction
+            rng = np.random.RandomState(seed) if seed is not None else np.random
+            perm = rng.permutation(all_idx)
+            n_val = int(np.round(len(all_idx) * val_fraction))
+            val_idx = perm[:n_val].tolist()
+            train_idx = perm[n_val:].tolist()
 
-            if sampling_instances is not None:
-                # resample / oversample indices for training (may include repetitions)
-                sampled_idx = resample(data, train_terms_df, strategy=training_configs.get('sampling_strategy', ''), I=sampling_instances)
-                if not sampled_idx:
-                    print("Warning: resample returned no indices (empty). Falling back to using all available indices for training.")
-                    sampled_idx = list(range(len(data['seq_2_terms'])))
+            # For consistency with downstream code, set sampled_idx to train indices (no repetitions)
+            sampled_idx = list(train_idx)
+            unique_train_idx = np.array(train_idx)
 
-                print(f"Resampled {len(sampled_idx)} indices for training (with repetitions).")
+            print(f"No sampling_instances set: randomly split {len(all_idx)} indices into {len(train_idx)} train and {len(val_idx)} val (val_fraction={val_fraction}).")
 
-                # use all UNIQUE indices in sampled_idx for training (class-balanced)
-                unique_train_idx = np.unique(sampled_idx)
-                print(f"Unique training indices: {len(unique_train_idx)}")
-
-                # split remaining indices for validation (no test set)
-                remaining_idx = np.setdiff1d(all_idx, unique_train_idx)
-                val_idx = remaining_idx.tolist()
-                print(f"Val indices: {len(val_idx)} (using all remaining indices), Test set removed")
-            else:
-                # No sampling_instances provided: split indices randomly into train/val according to val_fraction
-                rng = np.random.RandomState(seed) if seed is not None else np.random
-                perm = rng.permutation(all_idx)
-                n_val = int(np.round(len(all_idx) * val_fraction))
-                val_idx = perm[:n_val].tolist()
-                train_idx = perm[n_val:].tolist()
-
-                # For consistency with downstream code, set sampled_idx to train indices (no repetitions)
-                sampled_idx = list(train_idx)
-                unique_train_idx = np.array(train_idx)
-
-                print(f"No sampling_instances set: randomly split {len(all_idx)} indices into {len(train_idx)} train and {len(val_idx)} val (val_fraction={val_fraction}).")
-
-        # build tokenizer for PLM embeddings
+        # Get dimensions for PLM and BLM embeddings
         key = next(iter(data['plm_embeds']))
         plm_embedding_dim = int(np.asarray(data['plm_embeds'][key]).shape[0])
+        blm_key = next(iter(data['pmid_2_embed']))
+        blm_embedding_dim = int(np.asarray(data['pmid_2_embed'][blm_key]).shape[0])
+        
+        print(f"PLM embedding dimension: {plm_embedding_dim}")
+        print(f"BLM embedding dimension: {blm_embedding_dim}")
+
+        # Model configuration
         token_d = int(model_configs.get('token_dim', 512))
         num_plm_tokens = int(model_configs.get('num_plm_tokens', 32))
         num_blm_tokens = int(model_configs.get('num_blm_tokens', 32))
-        tokenizer = EmbedTokenizer(D=plm_embedding_dim, d=token_d, N=num_plm_tokens)
-
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        try:
-            tokenizer = tokenizer.to(device)
-        except Exception:
-            pass
-
-        # Build BLM projection layer
-        blm_key = next(iter(data['pmid_2_embed']))
-        blm_embedding_dim = int(np.asarray(data['pmid_2_embed'][blm_key]).shape[0])
-        blm_projection = torch.nn.Linear(blm_embedding_dim, token_d)
-        blm_projection = blm_projection.to(device)
-        print(f"BLM projection layer: {blm_embedding_dim} -> {token_d}")
-
-        # Freeze or unfreeze tokenizer parameters based on config
-        freeze_tokenizer = training_configs.get('freeze_tokenizer', True)
-        if freeze_tokenizer:
-            print("Freezing tokenizer parameters...")
-            for param in tokenizer.parameters():
-                param.requires_grad = False
-        else:
-            print("Tokenizer parameters will be trained...")
-            for param in tokenizer.parameters():
-                param.requires_grad = True
+        
+        print("Using raw features - projection layers will be part of the model")
 
         # datasets: training uses all unique sampled indices (with repetitions), val uses remaining indices
         train_dataset = EmbeddingsDataset(data, oversample_indices=sampled_idx)
@@ -172,25 +130,25 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         num_workers = int(training_configs.get('num_workers', 0))
 
         # pin_memory=True for faster host-to-device transfer when num_workers > 0
-        # Use simple_collate to avoid stacking issues with variable-length BLM embeddings
         pin_memory = True if num_workers > 0 else False
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
                                   pin_memory=pin_memory, collate_fn=simple_collate)
-        train_loader = PrefetchLoaderWithBLM(train_loader, device, blm_projection_layer=blm_projection, 
-                                             tokenizer=tokenizer, num_plm_tokens=num_plm_tokens, 
-                                             num_blm_tokens=num_blm_tokens)
+        train_loader = PrefetchLoaderWithRawFeatures(train_loader, device, num_blm_tokens=num_blm_tokens)
 
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
                                 pin_memory=pin_memory, collate_fn=simple_collate)
-        val_loader = PrefetchLoaderWithBLM(val_loader, device, blm_projection_layer=blm_projection, 
-                                           tokenizer=tokenizer, num_plm_tokens=num_plm_tokens, 
-                                           num_blm_tokens=num_blm_tokens)
+        val_loader = PrefetchLoaderWithRawFeatures(val_loader, device, num_blm_tokens=num_blm_tokens)
 
         # instantiate model
         num_classes = model_configs['max_terms']
 
         model = Query2Label_pl(num_classes       =num_classes, 
                                in_dim            =token_d,
+                               plm_dim           =plm_embedding_dim,
+                               blm_dim           =blm_embedding_dim,
+                               num_plm_tokens    =num_plm_tokens,
                                nheads            =model_configs.get('nheads', 8),
                                num_encoder_layers=model_configs.get('num_encoder_layers', 1),
                                num_decoder_layers=model_configs.get('num_decoder_layers', 2),
@@ -249,25 +207,6 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
         run_name_for_ckpt = run_name or training_configs.get('run_name', 'default_run')
         checkpoint_dir = os.path.join(checkpoint_dir, run_name_for_ckpt)
         os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        # Save tokenizer before training
-        print("Saving tokenizer state...")
-        try:
-            tok_state = tokenizer.state_dict()
-            tok_state_cpu = {k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in tok_state.items()}
-            tokenizer_state_path = os.path.join(checkpoint_dir, 'tokenizer_state_dict.pt')
-            torch.save(tok_state_cpu, tokenizer_state_path)
-            print(f"Saved tokenizer state to: {tokenizer_state_path}")
-
-            # also save the full tokenizer object (pickled) for convenience
-            tokenizer_obj_path = os.path.join(checkpoint_dir, 'tokenizer_object.pt')
-            try:
-                torch.save(tokenizer, tokenizer_obj_path)
-                print(f"Saved tokenizer object to: {tokenizer_obj_path}")
-            except Exception as e:
-                print(f"Warning: Could not save tokenizer object: {e}")
-        except Exception as e:
-            print(f"Warning: failed to save tokenizer: {e}")
         
         # Save a copy of the configs used for this run into the checkpoint directory
         try:

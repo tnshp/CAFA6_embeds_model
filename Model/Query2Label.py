@@ -77,19 +77,46 @@ class Query2Label(nn.Module):
         self,
         num_classes: int,
         in_dim: int,
+        plm_dim: int = None,
+        blm_dim: int = None,
+        num_plm_tokens: int = 32,
         nheads: int = 8,
         num_encoder_layers: int = 1,
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
         num_modalities: int = 2,
         modal_idx: list = [0, 32],
-        dropout: float = 0.1    
+        dropout: float = 0.1,
+        use_shared_classifier: bool = False
     ):
         super().__init__()
 
         self.num_classes = num_classes
         hidden_dim = in_dim
         self.hidden_dim = hidden_dim
+        self.num_plm_tokens = num_plm_tokens
+        
+        # Create PLM projection layers (one per token position)
+        # Each token position gets its own linear projection layer
+        if plm_dim is not None:
+            self.plm_projections = nn.ModuleList([
+                nn.Linear(plm_dim, hidden_dim) for _ in range(num_plm_tokens)
+            ])
+            # Initialize each PLM projection layer distinctly using orthogonal initialization
+            for idx, proj_layer in enumerate(self.plm_projections):
+                # Use orthogonal init with different gain for each layer to ensure distinctness
+                nn.init.orthogonal_(proj_layer.weight, gain=1.0 + idx * 0.01)
+                nn.init.constant_(proj_layer.bias, 0.0)
+        else:
+            self.plm_projections = None
+        
+        # Create single BLM projection layer (shared across all BLM tokens)
+        if blm_dim is not None:
+            self.blm_projection = nn.Linear(blm_dim, hidden_dim)
+            nn.init.xavier_uniform_(self.blm_projection.weight)
+            nn.init.constant_(self.blm_projection.bias, 0.0)
+        else:
+            self.blm_projection = None
         
         self.pos_encoder = (
             PositionalEncoding(hidden_dim, dropout=dropout)
@@ -122,8 +149,14 @@ class Query2Label(nn.Module):
             decoder_layer, num_layers=num_decoder_layers
         )
 
-        # Classification head: individual linear layer for each class
-        self.classifier = MultiClassLinear(num_classes, hidden_dim)
+        # Classification head: choose between shared or multi-class classifier
+        self.use_shared_classifier = use_shared_classifier
+        if use_shared_classifier:
+            # Shared linear layer for all classes
+            self.classifier = nn.Linear(hidden_dim, 1)
+        else:
+            # Individual linear layer for each class
+            self.classifier = MultiClassLinear(num_classes, hidden_dim)
 
         self._reset_parameters()
 
@@ -135,21 +168,57 @@ class Query2Label(nn.Module):
     def forward(
         self,
         query: torch.Tensor, 
-        backbone_features: torch.Tensor, 
+        backbone_features: torch.Tensor,
+        plm_features: torch.Tensor = None,
+        blm_features: torch.Tensor = None,
+        blm_mask: torch.Tensor = None,
         src_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         query: (B, num_classes, D) 
-        backbone_features: (B, L, C_in)
+        backbone_features: (B, L, C_in) - if plm_features and blm_features are None, use this directly
+        plm_features: (B, plm_dim) - raw PLM embeddings to be projected
+        blm_features: (B, max_blm_tokens, blm_dim) - raw BLM embeddings to be projected
+        blm_mask: (B, max_blm_tokens) - mask for valid BLM tokens (True = valid)
         src_key_padding_mask: (B, L) with True for padded positions (optional)
 
         Returns:
             logits: (B, num_classes)  (use BCEWithLogitsLoss)
         """
-        B, L, _ = backbone_features.shape
-
-        # project to hidden_dim
-        src = backbone_features
+        B = query.size(0)
+        
+        # If raw PLM and BLM features are provided, project them
+        if plm_features is not None and blm_features is not None:
+            # Project PLM features: each token position gets its own projection
+            plm_tokens = torch.stack([
+                proj_layer(plm_features) for proj_layer in self.plm_projections
+            ], dim=1)  # (B, num_plm_tokens, hidden_dim)
+            
+            # Project BLM features: shared projection for all BLM tokens
+            # blm_features: (B, max_blm_tokens, blm_dim)
+            B_blm, max_blm_tokens, blm_dim = blm_features.shape
+            blm_flat = blm_features.reshape(-1, blm_dim)  # (B * max_blm_tokens, blm_dim)
+            blm_projected = self.blm_projection(blm_flat)  # (B * max_blm_tokens, hidden_dim)
+            blm_tokens = blm_projected.reshape(B_blm, max_blm_tokens, self.hidden_dim)  # (B, max_blm_tokens, hidden_dim)
+            
+            # Concatenate PLM and BLM tokens
+            src = torch.cat([plm_tokens, blm_tokens], dim=1)  # (B, num_plm_tokens + max_blm_tokens, hidden_dim)
+            
+            # Create combined attention mask
+            plm_mask = torch.ones(B, self.num_plm_tokens, dtype=torch.bool, device=plm_features.device)
+            if blm_mask is None:
+                # If no BLM mask provided, assume all BLM tokens are valid
+                blm_mask = torch.ones(B, max_blm_tokens, dtype=torch.bool, device=blm_features.device)
+            combined_mask = torch.cat([plm_mask, blm_mask], dim=1)  # (B, num_plm_tokens + max_blm_tokens)
+            
+            # Update src_key_padding_mask for transformer (True = ignore)
+            src_key_padding_mask = ~combined_mask  # Invert: True = padded/ignore
+        else:
+            # Use pre-projected backbone_features directly
+            src = backbone_features
+            # src_key_padding_mask already provided (or None)
+        
+        L = src.size(1)
 
         #add modal encoding 
         for i in range(len(self.modal_idx)):
@@ -173,8 +242,13 @@ class Query2Label(nn.Module):
             memory_key_padding_mask=src_key_padding_mask,
         )  # (B, num_classes, D)
 
-        # classification per label (vectorized)
-        logits = self.classifier(hs)  # (B, num_classes)
+        # classification per label
+        if self.use_shared_classifier:
+            # Shared classifier: apply same linear layer to all class tokens
+            logits = self.classifier(hs).squeeze(-1)  # (B, num_classes, 1) -> (B, num_classes)
+        else:
+            # Multi-class classifier: different linear layer per class (vectorized)
+            logits = self.classifier(hs)  # (B, num_classes)
 
         return logits
 
