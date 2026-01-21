@@ -51,6 +51,40 @@ class CrossAttentionOnlyDecoderLayer(nn.Module):
         return tgt
 
 
+class CrossAttentionOnlyDecoder(nn.Module):
+    """Custom transformer decoder that only uses cross-attention layers (no self-attention)."""
+    
+    def __init__(self, decoder_layer: CrossAttentionOnlyDecoderLayer, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList([decoder_layer for _ in range(num_layers)])
+        self.num_layers = num_layers
+    
+    def forward(
+        self, 
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: torch.Tensor = None,
+        memory_mask: torch.Tensor = None,
+        tgt_key_padding_mask: torch.Tensor = None,
+        memory_key_padding_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            tgt: (B, T, D) - target sequence (queries)
+            memory: (B, S, D) - encoder output (source)
+            memory_key_padding_mask: (B, S) - mask for memory positions to ignore
+        
+        Returns:
+            output: (B, T, D) - decoder output
+        """
+        output = tgt
+        
+        for layer in self.layers:
+            output = layer(output, memory, memory_key_padding_mask=memory_key_padding_mask)
+        
+        return output
+
+
 class MultiClassLinear(nn.Module):
     """Individual linear layer for each class (vectorized)."""
     
@@ -195,6 +229,7 @@ class Query2Label(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
             )
+            self.decoder = CrossAttentionOnlyDecoder(decoder_layer, num_layers=num_decoder_layers)
         else:
             # Use standard transformer decoder layer with both self and cross attention
             decoder_layer = nn.TransformerDecoderLayer(
@@ -204,9 +239,9 @@ class Query2Label(nn.Module):
                 dropout=dropout,
                 batch_first=True,  # (B, T, D)
             )
-        self.decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=num_decoder_layers
-        )
+            self.decoder = nn.TransformerDecoder(
+                decoder_layer, num_layers=num_decoder_layers
+            )
 
         # Classification head: choose between shared or multi-class classifier
         self.use_shared_classifier = use_shared_classifier
