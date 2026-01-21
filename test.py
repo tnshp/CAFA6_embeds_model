@@ -17,15 +17,13 @@ class EmbeddingsTestDataset(Dataset):
     def __init__(self, 
                  data, 
                  max_go_embeds = 256,  
-                 oversample_indices=None,
-                 pad_type='random'
+                 oversample_indices=None
                 ):
         
         self.data = data
         self.max_go_embeds = max_go_embeds
         self.oversample_indices = oversample_indices if oversample_indices is not None else list(range(len(self.data['seq_2_terms'])))
         self.mask_embed = np.zeros(next(iter(self.data['go_embeds'].values())).shape, dtype=np.float32)
-        self.pad_type = pad_type  # 'random' or 'zero'
 
     def __len__(self):
         return len(self.oversample_indices)         
@@ -61,13 +59,6 @@ class EmbeddingsTestDataset(Dataset):
         # Get GO embeddings
         valid_terms = predicted_terms
         go_embeds = np.array([self.data['go_embeds'].get(term, self.mask_embed) for term in valid_terms])
-        
-        # For zero padding, pad with zero embeddings if needed
-        if self.pad_type == 'zero' and len(go_embeds) < self.max_go_embeds:
-            padding_needed = self.max_go_embeds - len(go_embeds)
-            padding = np.zeros((padding_needed, go_embeds.shape[1]), dtype=np.float32)
-            go_embeds = np.vstack([go_embeds, padding])
-            valid_terms = list(valid_terms) + ['PADDING'] * padding_needed
         
         return {
             'entryID'   : qseqid,
@@ -165,6 +156,27 @@ def prepare_data_test(data_paths, max_terms=256, aspect=None, pad_type='random')
     seq_2_terms = seq_2_terms[seq_2_terms['qseqid'].isin(available_proteins)]
     
     print(f"After filtering: {len(seq_2_terms)} sequences with both PLM features and GO terms")
+    
+    # Apply zero padding to terms_predicted and labels in the DataFrame
+    if pad_type == 'zero':
+        print(f"Applying zero padding to {len(seq_2_terms)} sequences...")
+        
+        def pad_sequence(terms):
+            if len(terms) < max_terms:
+                return terms + ['PADDING'] * (max_terms - len(terms))
+            return terms[:max_terms]
+        
+        seq_2_terms['terms_predicted'] = seq_2_terms['terms_predicted'].apply(pad_sequence)
+        
+        # Also pad the true_terms if they exist
+        if 'terms_true' in seq_2_terms.columns:
+            seq_2_terms['terms_true'] = seq_2_terms['terms_true'].apply(
+                lambda terms: terms if terms is None else (terms if isinstance(terms, list) else list(terms))
+            )
+        
+        # Verify padding
+        term_lengths_after = seq_2_terms['terms_predicted'].apply(len)
+        print(f"After zero padding - Min: {term_lengths_after.min()}, Max: {term_lengths_after.max()}, All equal to {max_terms}: {(term_lengths_after == max_terms).all()}")
 
     out = {'seq_2_terms': seq_2_terms,
            'plm_embeds': plm_features,
@@ -210,13 +222,13 @@ def load_model_and_tokenizer(model_dir, device):
     return model, num_blm_tokens, configs
 
 
-def run_inference(model, num_blm_tokens, data, configs, device, pad_type='random'):
+def run_inference(model, num_blm_tokens, data, configs, device):
     """Run inference on data and return predictions array."""
     print("Creating dataset and dataloader...")
     
     # Use all data for inference
     all_indices = list(range(len(data['seq_2_terms'])))
-    test_dataset = EmbeddingsTestDataset(data, oversample_indices=all_indices, pad_type=pad_type)
+    test_dataset = EmbeddingsTestDataset(data, oversample_indices=all_indices)
     
     batch_size = configs['training_configs'].get('batch_size', 64)
     num_workers = configs['training_configs'].get('num_workers', 0)
@@ -362,7 +374,7 @@ def main():
     # Run inference
     print("\nRunning inference...")
     predictions_array, true_array, all_indices = run_inference(
-        model, num_blm_tokens, data, configs, device, pad_type=pad_type
+        model, num_blm_tokens, data, configs, device
     )
     
     # Extract entry IDs and terms
