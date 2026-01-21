@@ -39,6 +39,8 @@ class Query2Label_pl(pl.LightningModule):
         epsilon: float = 0.5,
         # Classifier type: shared layer or multi-class
         use_shared_classifier: bool = False,
+        # Decoder: use cross-attention only (no self-attention)
+        decoder_cross_attention_only: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['ia_dict'])  # Don't save ia_dict in hparams
@@ -58,7 +60,8 @@ class Query2Label_pl(pl.LightningModule):
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            use_shared_classifier=use_shared_classifier
+            use_shared_classifier=use_shared_classifier,
+            decoder_cross_attention_only=decoder_cross_attention_only
         )
 
     

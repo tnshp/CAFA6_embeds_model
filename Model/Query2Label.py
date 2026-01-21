@@ -3,6 +3,54 @@ import torch.nn as nn
 import math
 
 
+class CrossAttentionOnlyDecoderLayer(nn.Module):
+    """Transformer decoder layer with ONLY cross-attention (no self-attention)."""
+    
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1):
+        super().__init__()
+        
+        # Cross-attention only (no self-attention)
+        self.multihead_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        
+        # Feed-forward network
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout1 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        self.dropout = dropout
+        self.activation = nn.functional.relu
+    
+    def forward(self, tgt: torch.Tensor, memory: torch.Tensor, 
+                memory_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        tgt: (B, T, D) - target (queries)
+        memory: (B, S, D) - encoder output
+        memory_key_padding_mask: (B, S) - True for positions to ignore
+        """
+        # Cross-attention only
+        attn_out, _ = self.multihead_attn(
+            tgt, memory, memory, 
+            key_padding_mask=memory_key_padding_mask
+        )
+        tgt = tgt + self.dropout1(attn_out)
+        tgt = self.norm1(tgt)
+        
+        # Feed-forward
+        ff_out = self.linear2(self.dropout2(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(ff_out)
+        tgt = self.norm2(tgt)
+        
+        return tgt
+
+
 class MultiClassLinear(nn.Module):
     """Individual linear layer for each class (vectorized)."""
     
@@ -87,7 +135,8 @@ class Query2Label(nn.Module):
         num_modalities: int = 2,
         modal_idx: list = [0, 32],
         dropout: float = 0.1,
-        use_shared_classifier: bool = False
+        use_shared_classifier: bool = False,
+        decoder_cross_attention_only: bool = False
     ):
         super().__init__()
 
@@ -138,13 +187,23 @@ class Query2Label(nn.Module):
             encoder_layer, num_layers=num_encoder_layers
         )
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=hidden_dim,
-            nhead=nheads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,  # (B, T, D)
-        )
+        if decoder_cross_attention_only:
+            # Use cross-attention only decoder layer
+            decoder_layer = CrossAttentionOnlyDecoderLayer(
+                d_model=hidden_dim,
+                nhead=nheads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+            )
+        else:
+            # Use standard transformer decoder layer with both self and cross attention
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=hidden_dim,
+                nhead=nheads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,  # (B, T, D)
+            )
         self.decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=num_decoder_layers
         )

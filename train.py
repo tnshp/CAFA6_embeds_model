@@ -167,7 +167,9 @@ def train_from_configs(configs, run_name=None, resume_from_checkpoint=None,
                                # IA weighting for F1 computation and WBCE loss
                                ia_dict=ia_dict,
                                # Epsilon for WBCE loss
-                               epsilon=float(training_configs.get('epsilon', 0.5)))
+                               epsilon=float(training_configs.get('epsilon', 0.5)),
+                               # Decoder: use cross-attention only
+                               decoder_cross_attention_only=bool(model_configs.get('decoder_cross_attention_only', False)))
 
         # compute total steps for scheduler and set on model.hparams
         max_epochs = int(training_configs.get('max_epochs', 10))

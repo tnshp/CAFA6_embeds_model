@@ -17,13 +17,15 @@ class EmbeddingsTestDataset(Dataset):
     def __init__(self, 
                  data, 
                  max_go_embeds = 256,  
-                 oversample_indices=None
+                 oversample_indices=None,
+                 pad_type='random'
                 ):
         
         self.data = data
         self.max_go_embeds = max_go_embeds
         self.oversample_indices = oversample_indices if oversample_indices is not None else list(range(len(self.data['seq_2_terms'])))
         self.mask_embed = np.zeros(next(iter(self.data['go_embeds'].values())).shape, dtype=np.float32)
+        self.pad_type = pad_type  # 'random' or 'zero'
 
     def __len__(self):
         return len(self.oversample_indices)         
@@ -60,6 +62,13 @@ class EmbeddingsTestDataset(Dataset):
         valid_terms = predicted_terms
         go_embeds = np.array([self.data['go_embeds'].get(term, self.mask_embed) for term in valid_terms])
         
+        # For zero padding, pad with zero embeddings if needed
+        if self.pad_type == 'zero' and len(go_embeds) < self.max_go_embeds:
+            padding_needed = self.max_go_embeds - len(go_embeds)
+            padding = np.zeros((padding_needed, go_embeds.shape[1]), dtype=np.float32)
+            go_embeds = np.vstack([go_embeds, padding])
+            valid_terms = list(valid_terms) + ['PADDING'] * padding_needed
+        
         return {
             'entryID'   : qseqid,
             'plm_embed' : plm_embed,
@@ -71,7 +80,7 @@ class EmbeddingsTestDataset(Dataset):
         }
 
 
-def prepare_data_test(data_paths, max_terms=256, aspect=None):
+def prepare_data_test(data_paths, max_terms=256, aspect=None, pad_type='random'):
     
     seq_2_terms_df    = data_paths['seq_2_terms_df']
     plm_features_path = data_paths['plm_features_path']
@@ -80,6 +89,8 @@ def prepare_data_test(data_paths, max_terms=256, aspect=None):
     go_term_to_aspect_path = data_paths.get('go_term_to_aspect_path', '/mnt/d/ML/Kaggle/CAFA6-new/data_packet1/go_term_to_aspect.npy')
 
     go_embeds_paths = data_paths['go_embeds_paths']
+    
+    print(f"Padding type: {pad_type}")
 
     seq_2_terms = pd.read_parquet(seq_2_terms_df, engine='fastparquet')
 
@@ -112,20 +123,28 @@ def prepare_data_test(data_paths, max_terms=256, aspect=None):
         print(f"After aspect filtering -  Mean: {term_lengths.mean():.2f}, Min: {term_lengths.min()}, Max: {term_lengths.max()}")
         print(f"After aspect filtering: {len(seq_2_terms)} sequences")
         print(f"After filtering ")
-        # Pad terms with random terms from the same aspect
-        print(f"Padding terms_predicted with random terms from aspect {aspect}...")
-        # Get all terms from this aspect that have embeddings
-        aspect_terms = [term for term, asp in go_term_to_aspect.items() if asp == aspect and term in embeddings_dict]
-        all_aspect_terms = np.array(aspect_terms)
         
-        tqdm.pandas(desc=f"Padding with random {aspect} terms")
-        seq_2_terms['terms_predicted'] = seq_2_terms['terms_predicted'].progress_apply(
-            lambda terms: pad_with_random_terms(terms, max_terms, all_aspect_terms)
-        )
-        
-        # Verify padding
-        term_lengths_after = seq_2_terms['terms_predicted'].apply(len)
-        print(f"After padding - Min: {term_lengths_after.min()}, Max: {term_lengths_after.max()}, Mean: {term_lengths_after.mean():.2f}")
+        # Only pad with random terms if pad_type is 'random'
+        if pad_type == 'random':
+            # Pad terms with random terms from the same aspect
+            print(f"Padding terms_predicted with random terms from aspect {aspect}...")
+            # Get all terms from this aspect that have embeddings
+            aspect_terms = [term for term, asp in go_term_to_aspect.items() if asp == aspect and term in embeddings_dict]
+            all_aspect_terms = np.array(aspect_terms)
+            
+            tqdm.pandas(desc=f"Padding with random {aspect} terms")
+            seq_2_terms['terms_predicted'] = seq_2_terms['terms_predicted'].progress_apply(
+                lambda terms: pad_with_random_terms(terms, max_terms, all_aspect_terms)
+            )
+            
+            # Verify padding
+            term_lengths_after = seq_2_terms['terms_predicted'].apply(len)
+            print(f"After padding - Min: {term_lengths_after.min()}, Max: {term_lengths_after.max()}, Mean: {term_lengths_after.mean():.2f}")
+        elif pad_type == 'zero':
+            print(f"Using zero padding (no random padding applied)")
+            # For zero padding, we'll handle it in the dataset __getitem__ method
+        else:
+            raise ValueError(f"Unknown pad_type: {pad_type}. Must be 'random' or 'zero'")
 
     print("Filtering sequences by term lengths and PLM features availability...")
     # Filter sequences by PLM features availability
@@ -135,8 +154,13 @@ def prepare_data_test(data_paths, max_terms=256, aspect=None):
     term_lengths = seq_2_terms['terms_predicted'].apply(len)
 
     #currently only using sequences with 256 terms, need to change later 
-    seq_2_terms = seq_2_terms[term_lengths == max_terms]
-
+    if pad_type == 'random':
+        # For random padding, we require exact max_terms length
+        seq_2_terms = seq_2_terms[term_lengths == max_terms]
+    elif pad_type == 'zero':
+        # For zero padding, we only require terms to be <= max_terms
+        seq_2_terms = seq_2_terms[term_lengths <= max_terms]
+    
     # Filter by PLM features availability
     seq_2_terms = seq_2_terms[seq_2_terms['qseqid'].isin(available_proteins)]
     
@@ -186,13 +210,13 @@ def load_model_and_tokenizer(model_dir, device):
     return model, num_blm_tokens, configs
 
 
-def run_inference(model, num_blm_tokens, data, configs, device):
+def run_inference(model, num_blm_tokens, data, configs, device, pad_type='random'):
     """Run inference on data and return predictions array."""
     print("Creating dataset and dataloader...")
     
     # Use all data for inference
     all_indices = list(range(len(data['seq_2_terms'])))
-    test_dataset = EmbeddingsTestDataset(data, oversample_indices=all_indices)
+    test_dataset = EmbeddingsTestDataset(data, oversample_indices=all_indices, pad_type=pad_type)
     
     batch_size = configs['training_configs'].get('batch_size', 64)
     num_workers = configs['training_configs'].get('num_workers', 0)
@@ -330,14 +354,15 @@ def main():
     print("\nPreparing data...")
     max_terms = configs['model_configs'].get('max_terms', 64)
     aspect = configs['training_configs'].get('aspect', 'P')
+    pad_type = 'zero'  # Change to 'zero' for zero padding
     
-    data = prepare_data_test(data_paths, max_terms=max_terms, aspect=aspect)
+    data = prepare_data_test(data_paths, max_terms=max_terms, aspect=aspect, pad_type=pad_type)
     print(f"Data prepared: {len(data['seq_2_terms'])} sequences")
     
     # Run inference
     print("\nRunning inference...")
     predictions_array, true_array, all_indices = run_inference(
-        model, num_blm_tokens, data, configs, device
+        model, num_blm_tokens, data, configs, device, pad_type=pad_type
     )
     
     # Extract entry IDs and terms
